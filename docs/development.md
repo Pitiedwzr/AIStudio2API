@@ -328,11 +328,14 @@ go build -trimpath -o aistudio2api.exe ./cmd/aistudio2api
 提交前执行与修改相关的功能验收、前端检查及 Go 静态检查：
 
 ```powershell
+go test -mod=readonly ./cmd/... ./internal/...
 go vet ./...
 ```
 
+主分支已有测试随生产实现保留。Pull Request 新增测试不属于已有测试，未经维护者明确同意不进入正式仓库；主动新增或从 Pull Request、Lab 摘取测试同样需先取得明确同意。正式仓库单元测试只覆盖不依赖真实网络、账户、浏览器和时序的稳定契约，协议研究、真实集成验收及原始证据保存在独立 Lab。
+
 Windows 发布包包含 `aistudio2api.exe` 与 `start.bat`；其他平台使用同一 Go 程序。Camoufox 在首次启动时自动准备。贡献内容聚焦单一功能或协议变更，并使用脱敏后的请求与响应样例。
 
-GitHub Actions 对 `main` 提交和 Pull Request 执行前端 lint、类型检查、构建，以及 `go.mod` 最低版本的 Go 检查。发布包使用当前稳定版 Go 构建，覆盖 Windows amd64、Linux amd64/arm64、macOS amd64/arm64。推送 `v*` 版本标签后自动创建 Release，附上二进制、启动文件、示例配置和文档；含 `-` 的标签发布为预发布版本。普通构建产物在 Actions 中保留七天，Release 附件长期保留。
+GitHub Actions 对 `main` 提交和 Pull Request 执行前端 lint、类型检查、构建、Go 单元测试，以及 `go.mod` 最低版本的 Go 检查。发布包使用当前稳定版 Go 构建，覆盖 Windows amd64、Linux amd64/arm64、macOS amd64/arm64。推送 `v*` 版本标签后自动创建 Release，附上二进制、启动文件、示例配置和文档；含 `-` 的标签发布为预发布版本。普通构建产物在 Actions 中保留七天，Release 附件长期保留。
 
 源码提交包含协议实现、前端源码和公开文档。本机账户状态、Cookie、token、proof、提示正文、响应正文和运行产物留在本机。
