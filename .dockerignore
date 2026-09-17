@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.env.*
+auth
+runtime
+node_modules
+web/node_modules
+internal/webui/dist
+aistudio2api
+aistudio2api.exe
+*.log
+*.tmp
+Dockerfile
+docker-compose*.yml
