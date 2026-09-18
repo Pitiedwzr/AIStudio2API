@@ -61,7 +61,8 @@ WORKDIR /app
 COPY --from=go-builder /out/aistudio2api /app/aistudio2api
 
 RUN mkdir -p /app/auth /app/runtime \
-    && chown -R app:app /app
+    && chown -R app:app /app \
+    && chmod 775 /app/auth /app/runtime
 
 USER app
 
