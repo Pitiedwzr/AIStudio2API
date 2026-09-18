@@ -367,6 +367,7 @@ cp .env.example .env
 | `AISTUDIO_AUTH_STATES` | `auth` | Account file, directory, or comma-separated paths |
 | `LISTEN_ADDR` | `127.0.0.1:2048` | Management UI and API listen address |
 | `PROXY_API_KEY` | empty | Public API key |
+| `ALLOW_REMOTE_CONTROL` | `false` | Allow management/control-plane requests from non-loopback clients; protect this with a strong API key and network firewall |
 | `PROXY` | empty | HTTP, HTTPS, or SOCKS5 proxy used by Chrome import, login, and accounts without an override |
 | `INIT_TIMEOUT` | `2m` | Per-account WAA initialization timeout |
 | `REQUEST_TIMEOUT` | `5m` | Maximum request execution time |

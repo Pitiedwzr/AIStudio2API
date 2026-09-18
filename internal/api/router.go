@@ -11,8 +11,9 @@ import (
 
 // Config 定义公开 API 服务配置
 type Config struct {
-	APIKey string
-	Admin  AdminService
+	APIKey             string
+	Admin              AdminService
+	AllowRemoteControl bool
 }
 
 type server struct {
@@ -60,7 +61,11 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
 	root.Handle("/v1/", requestLoggingMiddleware(config.Admin, corsMiddleware(authMiddleware(config.APIKey, public))))
 	root.Handle("/v1beta/", requestLoggingMiddleware(config.Admin, corsMiddleware(authMiddleware(config.APIKey, public))))
-	root.Handle("/api/", loopbackMiddleware(sameOriginMiddleware(control)))
+	controlHandler := sameOriginMiddleware(control)
+	if !config.AllowRemoteControl {
+		controlHandler = loopbackMiddleware(controlHandler)
+	}
+	root.Handle("/api/", controlHandler)
 	return root
 }
 

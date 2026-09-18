@@ -29,6 +29,7 @@ var configKeys = [...]string{
 	"AISTUDIO_AUTH_STATES",
 	"LISTEN_ADDR",
 	"PROXY_API_KEY",
+	"ALLOW_REMOTE_CONTROL",
 	"PROXY",
 	"INIT_TIMEOUT",
 	"REQUEST_TIMEOUT",
@@ -45,6 +46,7 @@ type Config struct {
 	AuthStates             string        `json:"auth_states"`
 	ListenAddr             string        `json:"listen_addr"`
 	ProxyAPIKey            string        `json:"proxy_api_key"`
+	AllowRemoteControl     bool          `json:"allow_remote_control"`
 	Proxy                  string        `json:"proxy"`
 	InitTimeout            time.Duration `json:"-"`
 	RequestTimeout         time.Duration `json:"-"`
@@ -92,6 +94,12 @@ func Load(path string) (Config, error) {
 	}
 	if value, ok := values["PROXY_API_KEY"]; ok {
 		cfg.ProxyAPIKey = strings.TrimSpace(value)
+	}
+	if value, ok := values["ALLOW_REMOTE_CONTROL"]; ok {
+		cfg.AllowRemoteControl, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("ALLOW_REMOTE_CONTROL 必须是 true 或 false")
+		}
 	}
 	if value, ok := values["PROXY"]; ok {
 		cfg.Proxy = strings.TrimSpace(value)
@@ -156,6 +164,7 @@ func (c Config) Save(path string) error {
 		"AISTUDIO_AUTH_STATES":     c.AuthStates,
 		"LISTEN_ADDR":              c.ListenAddr,
 		"PROXY_API_KEY":            c.ProxyAPIKey,
+		"ALLOW_REMOTE_CONTROL":     strconv.FormatBool(c.AllowRemoteControl),
 		"PROXY":                    c.Proxy,
 		"INIT_TIMEOUT":             c.InitTimeout.String(),
 		"REQUEST_TIMEOUT":          c.RequestTimeout.String(),
@@ -218,6 +227,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		AuthStates             string `json:"auth_states"`
 		ListenAddr             string `json:"listen_addr"`
 		ProxyAPIKey            string `json:"proxy_api_key"`
+		AllowRemoteControl     bool   `json:"allow_remote_control"`
 		Proxy                  string `json:"proxy"`
 		InitTimeout            string `json:"init_timeout"`
 		RequestTimeout         string `json:"request_timeout"`
@@ -232,6 +242,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		AuthStates:             c.AuthStates,
 		ListenAddr:             c.ListenAddr,
 		ProxyAPIKey:            c.ProxyAPIKey,
+		AllowRemoteControl:     c.AllowRemoteControl,
 		Proxy:                  c.Proxy,
 		InitTimeout:            c.InitTimeout.String(),
 		RequestTimeout:         c.RequestTimeout.String(),
@@ -250,6 +261,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		AuthStates             string `json:"auth_states"`
 		ListenAddr             string `json:"listen_addr"`
 		ProxyAPIKey            string `json:"proxy_api_key"`
+		AllowRemoteControl     bool   `json:"allow_remote_control"`
 		Proxy                  string `json:"proxy"`
 		InitTimeout            string `json:"init_timeout"`
 		RequestTimeout         string `json:"request_timeout"`
@@ -276,6 +288,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		AuthStates:             strings.TrimSpace(value.AuthStates),
 		ListenAddr:             strings.TrimSpace(value.ListenAddr),
 		ProxyAPIKey:            strings.TrimSpace(value.ProxyAPIKey),
+		AllowRemoteControl:     value.AllowRemoteControl,
 		Proxy:                  strings.TrimSpace(value.Proxy),
 		InitTimeout:            initTimeout,
 		RequestTimeout:         requestTimeout,
