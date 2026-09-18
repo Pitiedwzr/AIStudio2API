@@ -18,8 +18,12 @@ RUN go mod download
 
 COPY . .
 COPY --from=web-builder /src/internal/webui/dist ./internal/webui/dist
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/aistudio2api ./cmd/aistudio2api
+ARG TARGETOS
+ARG TARGETARCH
 
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" \
+    -o /out/aistudio2api ./cmd/aistudio2api
 FROM debian:bookworm-slim AS runtime
 
 # Camoufox is Firefox-based and needs these libraries even when running headless.
