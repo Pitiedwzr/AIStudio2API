@@ -45,6 +45,7 @@
 ## 系统要求
 
 - **Windows Release 运行**: Windows 10 或更高版本、`aistudio2api.exe` 和 `start.bat`
+- **Linux Release 运行**: 解压 `linux-amd64.tar.gz` 后运行 `./aistudio2api`，Camoufox 需要 Firefox 系运行库，Debian/Ubuntu 执行 `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 fonts-liberation`
 - **源码运行**: Go 1.25.0+、Node.js 22.13+ 或 24+，以及配套 npm
 - **操作系统**: Windows、macOS、Linux
 - **内存**: 单账户建议 2GB+ 可用内存，每个常驻预热账户约增加 0.6GB
@@ -203,6 +204,39 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 3. API 主机地址填写 `http://127.0.0.1:2048/v1`
 4. API 密钥填写 `.env` 中的 `PROXY_API_KEY`
 5. 从 `/v1/models` 获取模型，或手动添加 `gemini-3.6-flash`、`gemini-3.7-flash`
+
+[Claude Code](https://github.com/anthropics/claude-code) 使用 Anthropic 接口，子 agent 按 opus、sonnet、haiku 档位选择模型，以下变量把它们映射到 AI Studio 模型；WebSearch 由 Google Search 执行：
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:2048"
+$env:ANTHROPIC_API_KEY = "<PROXY_API_KEY>"
+$env:ANTHROPIC_MODEL = "gemini-3.8-flash"
+$env:ANTHROPIC_DEFAULT_OPUS_MODEL = "gemini-3.1-pro-preview"
+$env:ANTHROPIC_DEFAULT_SONNET_MODEL = "gemini-3.8-flash"
+$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "gemini-3.5-flash-lite"
+```
+
+[Codex](https://github.com/openai/codex) 使用 Responses 接口，在 `~/.codex/config.toml` 中添加 provider，并把 `PROXY_API_KEY` 写入 `AISTUDIO2API_KEY` 环境变量；Codex 的 `web_search` 工具由 Google Search 执行：
+
+```toml
+model = "gemini-3.8-flash"
+model_provider = "aistudio"
+
+[model_providers.aistudio]
+name = "AIStudio2API"
+base_url = "http://127.0.0.1:2048/v1"
+env_key = "AISTUDIO2API_KEY"
+wire_api = "responses"
+```
+
+[omp](https://github.com/can1357/oh-my-pi) 的 `web_search` 工具按自身的搜索来源顺序执行。设置 `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:2048` 与 `GEMINI_API_KEY=<PROXY_API_KEY>`，并在 omp 配置中优先使用 Gemini 来源：
+
+```yaml
+providers:
+  webSearchOrder:
+    - gemini
+  webSearchGeminiModel: gemini-3.8-flash
+```
 
 主要端点：
 
@@ -467,6 +501,7 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 | `service_stopped` | 在管理页面点击“启动服务” |
 | 没有可用账户 | 在账户页新增、启用或重新登录账户 |
 | Camoufox 准备失败 | 检查 GitHub Release 访问，或设置 `CAMOUFOX_PATH` |
+| Linux 预热账户 `exit status 255` | 安装 Camoufox 运行库，见“系统要求”中的 apt 命令 |
 
 ## 贡献
 
@@ -478,7 +513,6 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 - ✅ **媒体生成**: 已支持 Imagen 3、Veo 2、Nano Banana 图片/视频生成
 - ✅ **文档完善**: 更新并优化 `docs/` 目录下的详细使用文档与 API 规范
 - **一键部署**: 提供 Windows/Linux/macOS 的全自动化安装与启动脚本
-- **Docker 支持**: 提供标准 Dockerfile 及 Docker Compose 编排文件，简化部署流程
 - ✅ **Go 语言重构**: 将核心代理服务迁移至 Go 以提升并发性能与降低资源占用
 - ✅ **多Worker负载均衡**: 支持多 Google 账号轮询池，提高并发限额与稳定性
 

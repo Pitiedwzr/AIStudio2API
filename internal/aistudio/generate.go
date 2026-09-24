@@ -35,24 +35,39 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	if err != nil {
 		return nil, err
 	}
+	serverSideTools := explicitTools && len(request.Tools.Functions) > 0 && (len(request.Tools.Google) > 0 || request.Tools.GoogleSearch != nil)
 	length := 11
-	if runtime.Timezone != "" {
+	if runtime.Timezone != "" || serverSideTools {
 		length = 14
 	}
 	wire := make([]any, length)
 	wire[0] = wireModelName(request.Model)
 	wire[1] = contents
-	wire[2] = observedSafetySettings()
+	if !defaults.ImageRoute {
+		wire[2] = observedSafetySettings()
+	}
 	wire[3] = config
 	if request.System != "" {
 		wire[5] = encodeSystemInstruction(request.System)
 	}
-	if explicitTools {
+	switch {
+	case explicitTools:
 		wire[6] = tools
+	case defaults.OutputResolution:
+		// 可设置分辨率模型的默认扩展工具字段
+		wire[6] = []any{[]any{nil, nil, nil, []any{nil, []any{}}}}
 	}
 	wire[10] = int64(1)
-	if runtime.Timezone != "" {
-		wire[13] = []any{[]any{nil, nil, runtime.Timezone}}
+	if runtime.Timezone != "" || serverSideTools {
+		toolConfig := []any{nil}
+		if runtime.Timezone != "" {
+			toolConfig[0] = []any{nil, nil, runtime.Timezone}
+		}
+		if serverSideTools {
+			// 同时使用内置工具与函数调用时开启 include_server_side_tool_invocations
+			toolConfig = append(toolConfig, nil, true)
+		}
+		wire[13] = toolConfig
 	}
 	return json.Marshal(wire)
 }
@@ -92,8 +107,11 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 		hasReasoningEffort = false
 	}
 	if thinkingBudget != nil && !defaults.ThinkingBudget {
-		if !hasReasoningEffort || !defaults.ThinkingLevel {
+		if !defaults.ThinkingLevel {
 			return nil, fmt.Errorf("模型不支持 thinking budget")
+		}
+		if !hasReasoningEffort {
+			thinkingLevel = closestSupportedThinkingLevel(thinkingLevelForBudget(*thinkingBudget), defaults.ThinkingLevels)
 		}
 		thinkingBudget = nil
 	}
@@ -134,6 +152,10 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 		return nil, err
 	}
 	imageConfig := encodeImageConfig(config.ImageConfig)
+	if defaults.OutputResolution && imageConfig == nil {
+		// 可设置分辨率模型的默认输出尺寸
+		imageConfig = []any{nil, "1K"}
+	}
 	speechConfig, err := encodeSpeechConfig(config.SpeechConfig)
 	if err != nil {
 		return nil, err
@@ -221,6 +243,20 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 }
 
 var thinkingLevelsByEffort = []int64{4, 1, 2, 3}
+
+// thinkingLevelForBudget 按 Gemini OpenAI 兼容层的 1024、8192、24576 档位把思考预算换算为 thinking level
+func thinkingLevelForBudget(budget int64) int64 {
+	switch {
+	case budget <= 0:
+		return 4
+	case budget <= 1024:
+		return 1
+	case budget <= 8192:
+		return 2
+	default:
+		return 3
+	}
+}
 
 func closestSupportedThinkingLevel(requested int64, supported []int64) int64 {
 	requestedRank := slices.Index(thinkingLevelsByEffort, requested)
@@ -330,6 +366,11 @@ func encodeSpeechConfig(config *SpeechConfig) ([]any, error) {
 }
 
 func applyModelMediaDefaults(config GenerationConfig, model Model) GenerationConfig {
+	if model.Capabilities["image_route"] && imageModalityNeedsText(config.ResponseModalities) {
+		// 图像输出同时请求文本模态
+		config.ResponseModalities = []ResponseModality{ResponseModalityImage, ResponseModalityText}
+		return config
+	}
 	if config.ResponseModalities != nil {
 		return config
 	}
@@ -337,9 +378,29 @@ func applyModelMediaDefaults(config GenerationConfig, model Model) GenerationCon
 	case model.Capabilities["speech_route"], model.Capabilities["music_route"]:
 		config.ResponseModalities = []ResponseModality{ResponseModalityAudio}
 	case model.Capabilities["image_route"]:
-		config.ResponseModalities = []ResponseModality{ResponseModalityImage}
+		config.ResponseModalities = []ResponseModality{ResponseModalityImage, ResponseModalityText}
 	}
 	return config
+}
+
+// imageModalityNeedsText 判断图像模型请求是否缺 TEXT 模态
+func imageModalityNeedsText(modalities []ResponseModality) bool {
+	if modalities == nil {
+		return true
+	}
+	hasImage := false
+	hasText := false
+	for _, modality := range modalities {
+		switch ResponseModality(strings.ToUpper(strings.TrimSpace(string(modality)))) {
+		case ResponseModalityImage:
+			hasImage = true
+		case ResponseModalityText:
+			hasText = true
+		default:
+			return false
+		}
+	}
+	return hasImage && !hasText
 }
 
 func applySpeechTranscript(contents []Content, model Model, config GenerationConfig) []Content {
@@ -382,6 +443,7 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 	request.Config = applyModelMediaDefaults(request.Config, entry.model)
+	request.ImageRoute = entry.defaults.ImageRoute
 	request.Contents = applySpeechTranscript(request.Contents, entry.model, request.Config)
 	runtime := RequestContext{}
 	if c.contextProvider != nil {

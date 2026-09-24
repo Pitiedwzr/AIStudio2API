@@ -45,6 +45,7 @@
 ## System Requirements
 
 - **Windows Release Runtime**: Windows 10 or later, `aistudio2api.exe`, and `start.bat`
+- **Linux Release Runtime**: Extract `linux-amd64.tar.gz` and run `./aistudio2api`; Camoufox needs the Firefox system libraries, on Debian/Ubuntu run `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 fonts-liberation`
 - **Source Build**: Go 1.25.0+, Node.js 22.13+ or 24+, and its bundled npm
 - **Operating System**: Windows, macOS, Linux
 - **Memory**: 2GB+ available memory for one account; each resident prewarmed account adds about 0.6GB
@@ -203,6 +204,39 @@ For Cherry Studio:
 3. Set the API host to `http://127.0.0.1:2048/v1`
 4. Set the API key to `PROXY_API_KEY` from `.env`
 5. Load models from `/v1/models`, or add `gemini-3.6-flash` and `gemini-3.7-flash` manually
+
+[Claude Code](https://github.com/anthropics/claude-code) uses the Anthropic endpoint. Subagents pick models by the opus, sonnet, and haiku tiers; the variables below map them to AI Studio models. WebSearch runs on Google Search:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:2048"
+$env:ANTHROPIC_API_KEY = "<PROXY_API_KEY>"
+$env:ANTHROPIC_MODEL = "gemini-3.8-flash"
+$env:ANTHROPIC_DEFAULT_OPUS_MODEL = "gemini-3.1-pro-preview"
+$env:ANTHROPIC_DEFAULT_SONNET_MODEL = "gemini-3.8-flash"
+$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "gemini-3.5-flash-lite"
+```
+
+[Codex](https://github.com/openai/codex) uses the Responses endpoint. Add a provider to `~/.codex/config.toml` and put `PROXY_API_KEY` in the `AISTUDIO2API_KEY` environment variable. Codex's `web_search` tool runs on Google Search:
+
+```toml
+model = "gemini-3.8-flash"
+model_provider = "aistudio"
+
+[model_providers.aistudio]
+name = "AIStudio2API"
+base_url = "http://127.0.0.1:2048/v1"
+env_key = "AISTUDIO2API_KEY"
+wire_api = "responses"
+```
+
+[omp](https://github.com/can1357/oh-my-pi) runs its `web_search` tool through its own provider order. Set `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:2048` and `GEMINI_API_KEY=<PROXY_API_KEY>`, and put the Gemini provider first in the omp config:
+
+```yaml
+providers:
+  webSearchOrder:
+    - gemini
+  webSearchGeminiModel: gemini-3.8-flash
+```
 
 Main endpoints:
 
@@ -468,6 +502,7 @@ Common runtime states:
 | `service_stopped` | Click "Start service" in the management UI |
 | No account is available | Add, enable, or log in to an account from Accounts |
 | Camoufox preparation fails | Check access to GitHub Releases or set `CAMOUFOX_PATH` |
+| Linux account warmup `exit status 255` | Install the Camoufox runtime libraries, see the apt command in “System Requirements” |
 
 ## Contributing
 
@@ -479,7 +514,6 @@ Issues and Pull Requests are welcome!
 - ✅ **Media Generation**: Supports Imagen 3, Veo 2, Nano Banana image/video generation
 - ✅ **Documentation**: Update and optimize documentation in `docs/` directory
 - **One-Click Deployment**: Provide fully automated install and launch scripts for Windows/Linux/macOS
-- **Docker Support**: Provide standard Dockerfile and Docker Compose orchestration files
 - ✅ **Go Refactoring**: Migrate core proxy service to Go for improved concurrency and reduced resource usage
 - ✅ **Multi-Worker Load Balancing**: Support multi-Google account rotation pool for higher concurrency limits
 
