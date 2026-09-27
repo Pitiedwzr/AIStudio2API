@@ -61,8 +61,8 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	root := http.NewServeMux()
 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
 	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, public)))
-	root.Handle("/v1/", requestLoggingMiddleware(config.Admin, corsMiddleware(authMiddleware(config.APIKey, public))))
-	root.Handle("/v1beta/", requestLoggingMiddleware(config.Admin, corsMiddleware(authMiddleware(config.APIKey, public))))
+	root.Handle("/v1/", requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler)))
+	root.Handle("/v1beta/", requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler)))
 	controlHandler := sameOriginMiddleware(control)
 	if !config.AllowRemoteControl {
 		controlHandler = loopbackMiddleware(controlHandler)
