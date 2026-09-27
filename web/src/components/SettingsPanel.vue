@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { reactive, ref, watch } from 'vue'
 import { api } from '@/api'
-import { useI18n } from '@/i18n'
-import type { ServiceConfig } from '@/types'
+import { channelLabelKey, useI18n } from '@/i18n'
+import type { ServiceConfig, UpstreamChannel } from '@/types'
 import UiIcon from './UiIcon.vue'
+import UiSelect from './UiSelect.vue'
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -35,8 +36,20 @@ const form = reactive<ServiceConfig>({
   warm_startup_concurrency: 2,
   per_account_concurrency: 2,
   routing_strategy: 'round-robin',
+  upstream_channels: ['playground', 'build'],
+  waa_backend: 'camoufox',
   temporary_chat: false,
 })
+
+const upstreamChannelOptions: UpstreamChannel[] = ['playground', 'build']
+
+// toggleUpstreamChannel 切换通道并保持配置顺序，至少保留一个通道
+function toggleUpstreamChannel(channel: UpstreamChannel, enabled: boolean): void {
+  const selected = new Set(form.upstream_channels)
+  if (enabled) selected.add(channel)
+  else if (selected.size > 1) selected.delete(channel)
+  form.upstream_channels = upstreamChannelOptions.filter((option) => selected.has(option))
+}
 
 watch(
   () => props.config,
@@ -252,15 +265,57 @@ async function saveConfig(): Promise<void> {
         <span class="mb-2 block text-sm font-medium text-gray-300">{{
           t('settings.routingStrategy')
         }}</span>
-        <select
+        <UiSelect
           v-model="form.routing_strategy"
           class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
         >
           <option value="round-robin">{{ t('settings.routingRoundRobin') }}</option>
           <option value="fill-first">{{ t('settings.routingFillFirst') }}</option>
-        </select>
+        </UiSelect>
         <span class="mt-2 block text-xs text-gray-500">{{ t('settings.routingHelp') }}</span>
       </label>
+
+      <label class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <span class="mb-2 block text-sm font-medium text-gray-300">{{
+          t('settings.waaBackend')
+        }}</span>
+        <UiSelect
+          v-model="form.waa_backend"
+          class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+        >
+          <option value="camoufox">{{ t('settings.waaBackendCamoufox') }}</option>
+          <option value="go">{{ t('settings.waaBackendGo') }}</option>
+        </UiSelect>
+        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.waaBackendHelp') }}</span>
+      </label>
+
+      <fieldset class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <legend class="sr-only">{{ t('settings.upstreamChannels') }}</legend>
+        <span class="mb-2 block text-sm font-medium text-gray-300">{{
+          t('settings.upstreamChannels')
+        }}</span>
+        <div class="flex flex-wrap gap-4">
+          <label
+            v-for="channel in upstreamChannelOptions"
+            :key="channel"
+            class="flex items-center gap-2 text-sm text-gray-300"
+          >
+            <input
+              class="h-4 w-4 accent-blue-500"
+              type="checkbox"
+              :checked="form.upstream_channels.includes(channel)"
+              :disabled="
+                form.upstream_channels.length === 1 && form.upstream_channels.includes(channel)
+              "
+              @change="toggleUpstreamChannel(channel, ($event.target as HTMLInputElement).checked)"
+            />
+            {{ t(channelLabelKey(channel)) }}
+          </label>
+        </div>
+        <span class="mt-2 block text-xs text-gray-500">{{
+          t('settings.upstreamChannelsHelp')
+        }}</span>
+      </fieldset>
 
       <label class="flex items-center gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <input v-model="form.temporary_chat" class="h-4 w-4 accent-blue-500" type="checkbox" />

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/mail"
 	"os"
 	"path/filepath"
@@ -59,10 +60,52 @@ var (
 	ErrAccountNotFound = errors.New("账户不存在")
 	// ErrAccountLeased 表示账户当前存在进程内或跨进程租约
 	ErrAccountLeased = errors.New("账户正在使用")
+	// ErrAccountCoolingDown 表示租约账户在请求发出前进入冷却
+	ErrAccountCoolingDown = errors.New("账户已进入冷却")
 	// ErrResourceNotFound 表示资源没有创建账户映射
 	ErrResourceNotFound = errors.New("资源账户映射不存在")
 	errAccountLeaseBusy = ErrAccountLeased
 )
+
+// AllCoolingError 表示请求的全部候选账户都在冷却且不会很快恢复
+type AllCoolingError struct {
+	ModelID string
+	Until   time.Time
+}
+
+func (e *AllCoolingError) Error() string {
+	return fmt.Sprintf("模型 %s 的可用账户均在冷却，最早恢复时间 %s", e.ModelID, e.Until.Local().Format(time.RFC3339))
+}
+
+// HTTPStatus 返回额度耗尽对应的公开状态码
+func (e *AllCoolingError) HTTPStatus() int {
+	return http.StatusTooManyRequests
+}
+
+// ErrorCode 返回 OpenAI 兼容的额度错误代码
+func (e *AllCoolingError) ErrorCode() string {
+	return "rate_limit_exceeded"
+}
+
+// AccountsNotReadyError 表示支持请求的账户都处于不可调度状态
+type AccountsNotReadyError struct {
+	Reasons []string
+}
+
+func (e *AccountsNotReadyError) Error() string {
+	return ErrNoEligibleAccount.Error() + "：" + strings.Join(e.Reasons, "；")
+}
+
+func (e *AccountsNotReadyError) Unwrap() error {
+	return ErrNoEligibleAccount
+}
+
+// accountStateLabels 为不可调度账户状态的中文说明
+var accountStateLabels = map[AccountState]string{
+	AccountAuthRequired: "需要重新登录",
+	AccountUnavailable:  "不可用",
+	AccountDisabled:     "已停用",
+}
 
 // AccountConfig 表示账户目录中的固定最小配置
 type AccountConfig struct {
@@ -130,6 +173,7 @@ type Account struct {
 	runtime               accountRuntimeState
 	active                int
 	exclusive             bool
+	exclusiveWaiters      int
 	authRefreshers        int
 	leaseLock             *flock.Flock
 	leasePath             string
@@ -141,6 +185,7 @@ type Account struct {
 	modelAccessGeneration uint64
 	stateMessage          string
 	initializedAt         time.Time
+	buildModels           []Model
 }
 
 // AccountStatus 表示管理界面使用的脱敏账户状态
@@ -168,6 +213,7 @@ type AccountSelection struct {
 	AccountID         string
 	ResourceID        string
 	AllowedAccountIDs []string
+	PlaygroundOnly    bool
 }
 
 const preferredBootstrapModelID = "gemini-flash-latest"
@@ -214,6 +260,8 @@ type AccountPool struct {
 	perAccountConcurrency int
 	routingStrategy       string
 	lastPicked            map[string]string
+	lastPickedChannel     map[string]Channel
+	channels              []Channel
 	changed               chan struct{}
 }
 
@@ -226,6 +274,7 @@ type AccountLease struct {
 	modelAccessGeneration uint64
 	checkedAt             time.Time
 	refreshRuntime        bool
+	channel               Channel
 	operation             sync.Mutex
 	released              bool
 	once                  sync.Once
@@ -594,6 +643,60 @@ func accountSupportsSelection(account *Account, selection AccountSelection) bool
 	return false
 }
 
+// CatalogModels 返回完整目录，每项带有启用账户可以调用的通道
+func (p *AccountPool) CatalogModels(models []Model) []Model {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	catalog := make([]Model, len(models))
+	for index, model := range models {
+		model.Channels = p.modelChannelsLocked(model)
+		catalog[index] = model
+	}
+	return catalog
+}
+
+// EligibleModels 返回至少一个启用账户具有模型资格的目录项
+func (p *AccountPool) EligibleModels(models []Model) []Model {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	eligible := make([]Model, 0, len(models))
+	for _, model := range models {
+		if channels := p.modelChannelsLocked(model); len(channels) > 0 {
+			model.Channels = channels
+			eligible = append(eligible, model)
+		}
+	}
+	return eligible
+}
+
+// CanonicalModelID 把实时目录中的模型别名换成上游接受的正式模型 ID
+func (p *AccountPool) CanonicalModelID(modelID string) string {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	if p == nil || trimmed == "" {
+		return modelID
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	canonical := ""
+	for _, account := range p.accounts {
+		if account == nil {
+			continue
+		}
+		for _, model := range account.Models {
+			if model.ID == trimmed {
+				return modelID
+			}
+			if canonical == "" && modelMatchesID(model, trimmed) {
+				canonical = model.ID
+			}
+		}
+	}
+	if canonical == "" {
+		return modelID
+	}
+	return canonical
+}
+
 func modelMatchesID(model Model, modelID string) bool {
 	if model.ID == modelID {
 		return true
@@ -611,7 +714,7 @@ func NewAccountPool(accounts []*Account, perAccountConcurrency int) *AccountPool
 	p := &AccountPool{
 		accounts: append([]*Account(nil), accounts...), byID: make(map[string]*Account, len(accounts)),
 		resources: make(map[string]string), perAccountConcurrency: perAccountConcurrency, changed: make(chan struct{}),
-		routingStrategy: "round-robin", lastPicked: make(map[string]string),
+		routingStrategy: "round-robin", lastPicked: make(map[string]string), lastPickedChannel: make(map[string]Channel),
 	}
 	for _, account := range p.accounts {
 		if account == nil {
@@ -732,7 +835,7 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 		p.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
 	}
-	if account.exclusive || account.active > 0 {
+	if account.exclusive || account.exclusiveWaiters > 0 || account.active > 0 {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAccountLeased, accountID)
 	}
@@ -818,7 +921,25 @@ func (p *AccountPool) AcquireAccount(ctx context.Context, accountID string) (*Ac
 		return nil, ErrAccountNotFound
 	}
 	accountID = strings.TrimSpace(accountID)
+	p.mu.Lock()
+	waitingAccount := p.byID[accountID]
+	if waitingAccount == nil {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
+	}
+	waitingAccount.exclusiveWaiters++
+	p.notifyLocked()
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		waitingAccount.exclusiveWaiters--
+		p.notifyLocked()
+		p.mu.Unlock()
+	}()
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		p.mu.Lock()
 		account := p.byID[accountID]
 		if account == nil {
@@ -928,8 +1049,9 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 			continue
 		}
 		if !waitable {
+			err := p.noEligibleErrorLocked(selection)
 			p.mu.Unlock()
-			return nil, ErrNoEligibleAccount
+			return nil, err
 		}
 		changed := p.changed
 		p.mu.Unlock()
@@ -1043,15 +1165,54 @@ func (p *AccountPool) refreshAndValidateLease(
 			return false, ErrResourceNotFound
 		}
 	}
-	if selection.ModelID != "" && !accountSupportsSelection(account, selection) {
+	if selection.ModelID != "" && !p.channelSupportsLocked(account, lease.Channel(), selection) {
 		return false, nil
 	}
 	if selection.ResourceID == "" {
-		if _, active := accountCooldown(account, selectionAccessScope(selection), time.Now()); active {
+		if _, active := accountCooldown(account, lease.CooldownScope(selectionAccessScope(selection)), time.Now()); active {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+// NoEligibleError 返回列出候选账户不可调度原因的无账户错误
+func (p *AccountPool) NoEligibleError(selection AccountSelection) error {
+	if p == nil {
+		return ErrNoEligibleAccount
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.noEligibleErrorLocked(selection)
+}
+
+func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
+	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
+	var reasons []string
+	for _, account := range p.accounts {
+		if account == nil || account.Config.Enabled && account.State == AccountReady {
+			continue
+		}
+		if selection.ModelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) {
+			continue
+		}
+		label, ok := accountStateLabels[account.State]
+		if !ok {
+			label = string(account.State)
+		}
+		if !account.Config.Enabled {
+			label = accountStateLabels[AccountDisabled]
+		}
+		reason := account.ID + " " + label
+		if message := strings.TrimSpace(account.stateMessage); message != "" {
+			reason += "（" + message + "）"
+		}
+		reasons = append(reasons, reason)
+	}
+	if len(reasons) == 0 {
+		return ErrNoEligibleAccount
+	}
+	return &AccountsNotReadyError{Reasons: reasons}
 }
 
 func (p *AccountPool) markStaleAccountUnavailable(account *Account) {
@@ -1137,6 +1298,29 @@ func (l *AccountLease) markAuthenticationValidAt(checkedAt time.Time) error {
 // markAuthenticationRequiredAt 保存长连接中指定轮次的认证失败状态
 func (l *AccountLease) markAuthenticationRequiredAt(reason string, checkedAt time.Time) error {
 	return l.markAuthenticationStateAt(true, reason, checkedAt)
+}
+
+// CoolingDown 返回租约账户当前是否处于全局或指定模型的冷却
+func (l *AccountLease) CoolingDown(modelID string) bool {
+	if l == nil || l.account == nil {
+		return false
+	}
+	return l.pool.AccountCoolingDown(l.account.ID, l.CooldownScope(strings.TrimPrefix(strings.TrimSpace(modelID), "models/")))
+}
+
+// AccountCoolingDown 返回账户当前是否处于全局或指定模型的冷却
+func (p *AccountPool) AccountCoolingDown(accountID string, modelID string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	if account == nil {
+		return false
+	}
+	_, active := accountCooldown(account, strings.TrimPrefix(strings.TrimSpace(modelID), "models/"), time.Now())
+	return active
 }
 
 // markAuthenticationStateAt 写回指定顺序时间的账户认证状态
@@ -2013,7 +2197,7 @@ func (p *AccountPool) Status() []AccountStatus {
 		_, active := accountCooldown(account, "", now)
 		if !account.Config.Enabled {
 			state = AccountDisabled
-		} else if account.exclusive || account.authRefreshers > 0 || account.active > 0 {
+		} else if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0 {
 			state = AccountBusy
 		} else if state == AccountReady && active {
 			state = AccountCooldown
@@ -2084,7 +2268,6 @@ func (p *AccountPool) classifyCandidatesLocked(
 	warmAccountIDs []string,
 ) (AccountCandidateGroups, error) {
 	modelID := selection.ModelID
-	modelAccessScope := selectionAccessScope(selection)
 	if modelID != "" {
 		if !p.hasModelCatalogLocked() {
 			return AccountCandidateGroups{}, ErrNoEligibleAccount
@@ -2113,25 +2296,25 @@ func (p *AccountPool) classifyCandidatesLocked(
 		if account == nil || !account.Config.Enabled || account.State != AccountReady {
 			continue
 		}
-		if modelID != "" && !accountSupportsSelection(account, selection) {
+		if modelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) {
 			continue
 		}
 		groups.Eligible = true
-		if cooldown, active := accountCooldown(account, modelAccessScope, now); active {
-			if groups.EarliestCooldown.IsZero() || cooldown.Until.Before(groups.EarliestCooldown) {
-				groups.EarliestCooldown = cooldown.Until
+		if until, active := p.accountChannelCooldownLocked(account, selection, now); active {
+			if groups.EarliestCooldown.IsZero() || until.Before(groups.EarliestCooldown) {
+				groups.EarliestCooldown = until
 			}
 			continue
 		}
 		_, isWarm := warm[account.ID]
 		switch {
-		case isWarm && !account.exclusive && account.authRefreshers == 0 && account.active == 0:
+		case isWarm && !account.exclusive && account.exclusiveWaiters == 0 && account.authRefreshers == 0 && account.active == 0:
 			groups.WarmReady = append(groups.WarmReady, account.ID)
-		case isWarm && !account.exclusive && account.authRefreshers == 0 && account.active < p.perAccountConcurrency:
+		case isWarm && !account.exclusive && account.exclusiveWaiters == 0 && account.authRefreshers == 0 && account.active < p.perAccountConcurrency:
 			groups.WarmAvailable = append(groups.WarmAvailable, account.ID)
 		case isWarm:
 			groups.WarmBusy = append(groups.WarmBusy, account.ID)
-		case account.exclusive || account.authRefreshers > 0 || account.active > 0:
+		case account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0:
 			groups.StandbyBusy = append(groups.StandbyBusy, account.ID)
 		default:
 			groups.StandbyReady = append(groups.StandbyReady, account.ID)
@@ -2147,20 +2330,20 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 	}
 	waitable := false
 	var earliest time.Time
-	for _, index := range indices {
-		account := p.accounts[index]
+	for _, candidate := range p.channelCandidatesLocked(indices, selection) {
+		account := p.accounts[candidate.index]
 		if account == nil || !account.Config.Enabled || account.State != AccountReady {
 			continue
 		}
-		if selection.ModelID != "" && !accountSupportsSelection(account, selection) {
+		if selection.ModelID != "" && !p.channelSupportsLocked(account, candidate.channel, selection) {
 			continue
 		}
 		waitable = true
-		if account.exclusive || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency {
+		if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency {
 			continue
 		}
 		if selection.ResourceID == "" {
-			if cooldown, active := accountCooldown(account, selectionAccessScope(selection), now); active {
+			if cooldown, active := accountCooldown(account, ChannelCooldownScope(candidate.channel, selectionAccessScope(selection)), now); active {
 				if earliest.IsZero() || cooldown.Until.Before(earliest) {
 					earliest = cooldown.Until
 				}
@@ -2187,9 +2370,11 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 		account.active++
 		account.LastUsed = now
 		p.lastPicked[selectionAccessScope(selection)] = account.ID
+		p.lastPickedChannel[selectionAccessScope(selection)] = candidate.channel
 		return &AccountLease{
 			pool: p, account: account, authGeneration: account.authGeneration,
 			modelAccessGeneration: account.modelAccessGeneration, refreshRuntime: refreshRuntime, checkedAt: now.UTC(),
+			channel: candidate.channel,
 		}, time.Time{}, true, nil
 	}
 	return nil, earliest, waitable, nil
@@ -2206,7 +2391,7 @@ func (p *AccountPool) hasModelLocked(modelID string) bool {
 			}
 		}
 	}
-	return false
+	return p.hasBuildModelLocked(modelID, "")
 }
 
 func (p *AccountPool) hasModelCatalogLocked() bool {
@@ -2229,7 +2414,7 @@ func (p *AccountPool) hasModelMethodLocked(modelID string, method string) bool {
 			}
 		}
 	}
-	return false
+	return p.hasBuildModelLocked(modelID, method)
 }
 
 func (p *AccountPool) hasModelCapabilityLocked(modelID string, capability string) bool {
@@ -2398,6 +2583,44 @@ func (p *AccountPool) setAccountState(accountID string, state AccountState, reas
 	account.stateMessage = strings.TrimSpace(reason)
 	p.notifyLocked()
 	return nil
+}
+
+// EnabledAccounts 返回已启用账户 ID 与其中 ready 或 busy 的账户数量
+func (p *AccountPool) EnabledAccounts() ([]string, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	ids := make([]string, 0, len(p.accounts))
+	schedulable := 0
+	for _, account := range p.accounts {
+		if account == nil || !account.Config.Enabled {
+			continue
+		}
+		ids = append(ids, account.ID)
+		_, cooling := accountCooldown(account, "", now)
+		if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0 || account.State == AccountReady && !cooling {
+			schedulable++
+		}
+	}
+	return ids, schedulable
+}
+
+// Activity 返回账户是否存在活动租约或独占操作及最近使用时间
+func (p *AccountPool) Activity(accountID string) (bool, time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[accountID]
+	if account == nil {
+		return false, time.Time{}
+	}
+	return account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0, account.LastUsed
+}
+
+// Changed 返回账户池下一次租约或状态变化时关闭的通道
+func (p *AccountPool) Changed() <-chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.changed
 }
 
 func (p *AccountPool) notifyLocked() {

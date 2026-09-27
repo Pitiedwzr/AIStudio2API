@@ -18,6 +18,7 @@ func (service *trackedService) Transcribe(
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	api.SetAccessLogGenerationConfig(ctx, request.Config)
 	api.StartAccessLog(ctx)
+	request.Model = service.pool.CanonicalModelID(request.Model)
 	requestCtx, cancel, err := service.dataRequestContext(ctx)
 	if err != nil {
 		api.SetAccessLogError(ctx, err)
@@ -62,7 +63,7 @@ func (service *trackedService) Transcribe(
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(cause)
 		expectedGeneration := workerGenerations[accountID]
 		recovered, currentGeneration, recoveryErr := service.recoverWorkerOnce(
-			accountID, expectedGeneration, recoveredWorkers, true, workerFailed || waaRuntimeFailed,
+			recoveryCtx, accountID, expectedGeneration, recoveredWorkers, true, workerFailed || waaRuntimeFailed,
 		)
 		if recoveryErr != nil {
 			return false, recoveryErr

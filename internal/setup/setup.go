@@ -126,6 +126,9 @@ func importIsolatedLogin(
 		return errors.Join(err, store.Delete(account))
 	}
 	fmt.Fprintf(os.Stdout, "账户已保存: %s\n", account.Config.Label)
+	if result.DriveError != "" {
+		fmt.Fprintf(os.Stdout, "Drive 授权失败: %s\n", result.DriveError)
+	}
 	return nil
 }
 
@@ -138,18 +141,19 @@ func importChromeAccounts(ctx context.Context, cfg config.Config, store *aistudi
 			return err
 		}
 	}
+	var accountIDs []string
 	if len(options.profiles) == 0 && len(options.emails) == 0 {
 		accounts, err := chromeauth.Discover(root)
 		if err != nil {
 			return err
 		}
-		options.profiles, err = promptChromeProfiles(accounts, input, output)
+		accountIDs, err = promptChromeAccounts(accounts, input, output)
 		if err != nil {
 			return err
 		}
 	}
 	results, err := chromeauth.Import(ctx, chromeauth.ImportOptions{
-		ChromeRoot: root, Proxy: options.proxy, Profiles: options.profiles, Emails: options.emails,
+		ChromeRoot: root, Proxy: options.proxy, Profiles: options.profiles, Emails: options.emails, AccountIDs: accountIDs,
 	})
 	if err != nil {
 		return err
@@ -181,7 +185,7 @@ func importChromeAccounts(ctx context.Context, cfg config.Config, store *aistudi
 	return nil
 }
 
-func promptChromeProfiles(accounts []chromeauth.Account, input io.Reader, output io.Writer) (setupStrings, error) {
+func promptChromeAccounts(accounts []chromeauth.Account, input io.Reader, output io.Writer) ([]string, error) {
 	available := make([]chromeauth.Account, 0, len(accounts))
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(table, "编号\t状态\tProfile\t显示名\t邮箱")
@@ -210,7 +214,7 @@ func promptChromeProfiles(accounts []chromeauth.Account, input io.Reader, output
 	if line == "" {
 		return nil, fmt.Errorf("未选择账号")
 	}
-	selected := make(setupStrings, 0)
+	selected := make([]string, 0)
 	seen := make(map[int]struct{})
 	for _, raw := range strings.Split(line, ",") {
 		index, err := strconv.Atoi(strings.TrimSpace(raw))
@@ -221,7 +225,7 @@ func promptChromeProfiles(accounts []chromeauth.Account, input io.Reader, output
 			continue
 		}
 		seen[index] = struct{}{}
-		selected = append(selected, available[index-1].Profile)
+		selected = append(selected, available[index-1].ID)
 	}
 	return selected, nil
 }

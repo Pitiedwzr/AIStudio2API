@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { api } from '@/api'
-import { useI18n, type TranslationKey } from '@/i18n'
+import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
 import type { Account, Cooldown, RequestState, RequestSummary } from '@/types'
 import UiIcon from './UiIcon.vue'
 
@@ -21,6 +21,7 @@ const emit = defineEmits<{
 
 const { locale, t } = useI18n()
 const cancelling = ref('')
+const refreshing = ref(false)
 
 const requestStateKeys: Record<RequestState, TranslationKey> = {
   queued: 'state.queued',
@@ -52,6 +53,13 @@ function formatTime(value: string): string {
   }).format(new Date(value))
 }
 
+// refresh 请求刷新数据，图标短暂旋转确认点击
+function refresh(): void {
+  refreshing.value = true
+  emit('refresh')
+  window.setTimeout(() => (refreshing.value = false), 600)
+}
+
 // cancelRequest 停止活动请求并刷新摘要
 async function cancelRequest(request: RequestSummary): Promise<void> {
   cancelling.value = request.id
@@ -73,9 +81,9 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
       <button
         class="flex items-center gap-1 rounded bg-blue-600 px-3 py-1.5 text-xs text-white transition hover:bg-blue-500"
         type="button"
-        @click="emit('refresh')"
+        @click="refresh"
       >
-        <UiIcon name="refresh" :size="13" />
+        <UiIcon name="refresh" :size="13" :class="{ 'animate-spin': refreshing }" />
         {{ t('app.refresh') }}
       </button>
     </div>
@@ -101,7 +109,7 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
         <div v-else class="space-y-3">
           <div
             v-for="cooldown in cooldowns"
-            :key="`${cooldown.account_id}:${cooldown.model_id}`"
+            :key="`${cooldown.account_id}:${cooldown.channel}:${cooldown.model_id}`"
             class="overflow-hidden rounded border border-[#30363d] bg-[#0d1117]"
           >
             <div
@@ -111,9 +119,10 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
                 <strong class="block truncate text-sm text-gray-200">{{
                   cooldown.model_id
                 }}</strong>
-                <span class="text-xs text-gray-500">{{
-                  accountLabel(cooldown.account_id, cooldown.account_label)
-                }}</span>
+                <span class="text-xs text-gray-500"
+                  >{{ accountLabel(cooldown.account_id, cooldown.account_label) }} ·
+                  {{ t(channelLabelKey(cooldown.channel)) }}</span
+                >
               </div>
               <span class="shrink-0 text-xs text-yellow-400">
                 {{ t('state.cooldown') }}
@@ -157,9 +166,12 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
               </div>
             </div>
             <div class="text-right text-xs text-gray-500">
-              <span class="block">{{
-                accountLabel(request.account_id, request.account_label)
-              }}</span>
+              <span class="block"
+                >{{ accountLabel(request.account_id, request.account_label)
+                }}<template v-if="request.channel">
+                  · {{ t(channelLabelKey(request.channel)) }}</template
+                ></span
+              >
               <time class="font-mono">{{ formatTime(request.started_at) }}</time>
             </div>
             <button
@@ -167,6 +179,7 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
               class="rounded border border-red-900/50 bg-red-900/30 px-3 py-1 text-xs text-red-400 transition hover:bg-red-900/50 disabled:opacity-50"
               type="button"
               :disabled="cancelling !== ''"
+              :aria-busy="cancelling === request.id"
               @click="cancelRequest(request)"
             >
               {{ t('requests.stop') }}

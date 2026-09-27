@@ -182,6 +182,9 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 		))
 		return api.AdminAccount{}, err
 	}
+	if result.DriveError != "" {
+		admin.requests.log("auth", "WARN", "账户添加 | Drive 授权失败 | 错误="+result.DriveError)
+	}
 	admin.requests.log("auth", "INFO", "账户添加 | 2/2 | 保存认证状态")
 	if _, err := aistudio.NewSigner().Sign(result.StorageState); err != nil {
 		return api.AdminAccount{}, fmt.Errorf("认证状态无法用于 AI Studio: %w", err)
@@ -223,15 +226,16 @@ func (admin *runtimeAdmin) ChromeImportProfiles(context.Context) ([]api.ChromeIm
 		if _, exists := existing[email]; exists {
 			continue
 		}
+		existing[email] = struct{}{}
 		profiles = append(profiles, api.ChromeImportProfile{
-			Profile: account.Profile, DisplayName: account.DisplayName, Email: email, Locale: account.Locale,
+			ID: account.ID, Profile: account.Profile, DisplayName: account.DisplayName, Email: email, Locale: account.Locale,
 		})
 	}
 	return profiles, nil
 }
 
 func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.ChromeImportInput) ([]api.AdminAccount, error) {
-	if len(input.Profiles) == 0 {
+	if len(input.AccountIDs) == 0 {
 		return nil, invalidAccount(fmt.Errorf("未选择 Chrome 账号"))
 	}
 	root, err := chromeauth.DefaultChromeRoot()
@@ -240,7 +244,7 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 	}
 	accountProxy := strings.TrimSpace(input.Proxy)
 	results, err := chromeauth.Import(ctx, chromeauth.ImportOptions{
-		ChromeRoot: root, Proxy: admin.effectiveProxy(accountProxy), Profiles: input.Profiles,
+		ChromeRoot: root, Proxy: admin.effectiveProxy(accountProxy), AccountIDs: input.AccountIDs,
 	})
 	if err != nil {
 		return nil, err
@@ -424,6 +428,9 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 		return api.AdminAccount{}, errors.Join(
 			invalidAccount(fmt.Errorf("登录邮箱与账户不一致: %s", result.Email)), lease.Release(),
 		)
+	}
+	if result.DriveError != "" {
+		admin.requests.log(account.Config.Label, "WARN", "账户登录 | Drive 授权失败 | 错误="+result.DriveError)
 	}
 	admin.requests.log(account.Config.Label, "INFO", "账户登录 | 2/2 | 保存认证状态")
 	if _, err := aistudio.NewSigner().Sign(result.StorageState); err != nil {
@@ -624,7 +631,7 @@ func (admin *runtimeAdmin) syncAccountModelCatalog(ctx context.Context, account 
 
 // publishRuntimeSnapshot 推送管理页权威运行状态
 func (admin *runtimeAdmin) publishRuntimeSnapshot(ctx context.Context, status api.AdminStatus) {
-	models, err := admin.service.Models(ctx)
+	models, err := admin.Models(ctx)
 	if err != nil {
 		return
 	}
@@ -715,7 +722,9 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		RoutingStrategy:        value.RoutingStrategy,
+		UpstreamChannels:       value.UpstreamChannels,
 		TemporaryChat:          value.TemporaryChat,
+		WAABackend:             value.WAABackend,
 	}
 	if err := cfg.Save(admin.configPath); err != nil {
 		return api.RuntimeConfig{}, err
@@ -739,15 +748,16 @@ func (admin *runtimeAdmin) Cooldowns(context.Context) ([]api.AdminCooldown, erro
 				effective[modelID] = global
 			}
 		}
-		for modelID, cooldown := range account.Cooldowns {
-			if modelID == "*" || !cooldown.Active(now) {
+		for key, cooldown := range account.Cooldowns {
+			if key == "*" || !cooldown.Active(now) {
 				continue
 			}
-			if _, ok := models[modelID]; !ok {
+			modelID, build := strings.CutPrefix(key, string(aistudio.ChannelBuild)+":")
+			if _, ok := models[modelID]; !ok && !build {
 				continue
 			}
-			if current, ok := effective[modelID]; !ok || cooldown.Until.After(current.Until) {
-				effective[modelID] = cooldown
+			if current, ok := effective[key]; !ok || cooldown.Until.After(current.Until) {
+				effective[key] = cooldown
 			}
 		}
 		modelIDs := make([]string, 0, len(effective))
@@ -755,10 +765,15 @@ func (admin *runtimeAdmin) Cooldowns(context.Context) ([]api.AdminCooldown, erro
 			modelIDs = append(modelIDs, modelID)
 		}
 		sort.Strings(modelIDs)
-		for _, modelID := range modelIDs {
-			cooldown := effective[modelID]
+		for _, key := range modelIDs {
+			cooldown := effective[key]
+			channel := string(aistudio.ChannelPlayground)
+			modelID, build := strings.CutPrefix(key, string(aistudio.ChannelBuild)+":")
+			if build {
+				channel = string(aistudio.ChannelBuild)
+			}
 			cooldowns = append(cooldowns, api.AdminCooldown{
-				AccountID: account.ID, AccountLabel: account.Label,
+				AccountID: account.ID, AccountLabel: account.Label, Channel: channel,
 				ModelID: modelID, Until: cooldown.Until, Reason: cooldown.Reason,
 			})
 		}
@@ -782,9 +797,9 @@ type adminEventSource interface {
 	Cooldowns(context.Context) ([]api.AdminCooldown, error)
 }
 
-// Models 返回当前运行时模型快照
+// Models 返回当前运行时完整目录与各模型可用通道
 func (admin *runtimeAdmin) Models(ctx context.Context) ([]aistudio.Model, error) {
-	return admin.service.Models(ctx)
+	return admin.service.catalogModels(), nil
 }
 
 func (admin *runtimeAdmin) Events(ctx context.Context) (<-chan api.AdminEvent, error) {
@@ -959,6 +974,17 @@ func (registry *requestRegistry) markRunning(id string, accountID string, accoun
 		tracked.request.AccountID = accountID
 		tracked.request.AccountLabel = accountLabel
 		tracked.request.State = "running"
+		registry.active[id] = tracked
+		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
+	}
+	registry.mu.Unlock()
+}
+
+// markChannel 记录请求本次尝试使用的上游通道
+func (registry *requestRegistry) markChannel(id string, channel string) {
+	registry.mu.Lock()
+	if tracked, exists := registry.active[id]; exists {
+		tracked.request.Channel = channel
 		registry.active[id] = tracked
 		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
 	}
@@ -1282,7 +1308,9 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		WarmStartupConcurrency: cfg.WarmStartupConcurrency,
 		PerAccountConcurrency:  cfg.PerAccountConcurrency,
 		RoutingStrategy:        cfg.RoutingStrategy,
+		UpstreamChannels:       cfg.UpstreamChannels,
 		TemporaryChat:          cfg.TemporaryChat,
+		WAABackend:             cfg.WAABackend,
 	}
 }
 

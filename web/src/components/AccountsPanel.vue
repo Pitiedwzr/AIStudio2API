@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { api } from '@/api'
+import { confirmAction } from '@/confirm'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type { Account, AccountDraft, AccountState, ChromeImportProfile } from '@/types'
 import UiIcon from './UiIcon.vue'
@@ -26,6 +27,17 @@ const editingAccountID = ref('')
 const pendingAction = ref('')
 const chromeProfiles = ref<ChromeImportProfile[]>([])
 const selectedChromeProfiles = ref<string[]>([])
+const allChromeProfilesSelected = computed(
+  () =>
+    chromeProfiles.value.length > 0 &&
+    selectedChromeProfiles.value.length === chromeProfiles.value.length,
+)
+
+function toggleAllChromeProfiles(): void {
+  selectedChromeProfiles.value = allChromeProfilesSelected.value
+    ? []
+    : chromeProfiles.value.map((profile) => profile.id)
+}
 const accountEnvironment = reactive({
   proxy: '',
   locale: defaultAccountLocale,
@@ -97,7 +109,7 @@ async function openChromeImport(): Promise<void> {
   pendingAction.value = 'chrome-discover'
   try {
     chromeProfiles.value = await api.chromeImportProfiles()
-    selectedChromeProfiles.value = chromeProfiles.value.map((profile) => profile.profile)
+    selectedChromeProfiles.value = []
     showChromeImport.value = true
   } catch (error) {
     actionError(error)
@@ -118,7 +130,7 @@ async function importChromeAccounts(): Promise<void> {
   pendingAction.value = 'chrome-import'
   try {
     const result = await api.importChromeAccounts({
-      profiles: [...selectedChromeProfiles.value],
+      account_ids: [...selectedChromeProfiles.value],
       ...accountEnvironment,
     })
     showChromeImport.value = false
@@ -145,6 +157,7 @@ async function saveAccount(): Promise<void> {
     await api.updateAccount(editingAccountID.value, { ...draft })
     closeEditor()
     emit('refresh')
+    emit('notice', t('accounts.saved'), 'success')
   } catch (error) {
     actionError(error)
   } finally {
@@ -181,6 +194,11 @@ async function runAccountAction(account: Account, action: 'login' | 'verify'): P
       await api.verifyAccount(account.id)
     }
     emit('refresh')
+    emit(
+      'notice',
+      t(action === 'login' ? 'accounts.loginComplete' : 'accounts.verified'),
+      'success',
+    )
   } catch (error) {
     actionError(error)
   } finally {
@@ -190,11 +208,12 @@ async function runAccountAction(account: Account, action: 'login' | 'verify'): P
 
 // removeAccount 删除用户确认的账户
 async function removeAccount(account: Account): Promise<void> {
-  if (!window.confirm(t('accounts.deleteConfirm'))) return
+  if (!(await confirmAction(t('accounts.deleteConfirm'), t('common.delete')))) return
   pendingAction.value = `delete:${account.id}`
   try {
     await api.deleteAccount(account.id)
     emit('refresh')
+    emit('notice', t('accounts.deleted'), 'success')
   } catch (error) {
     actionError(error)
   } finally {
@@ -214,6 +233,7 @@ async function removeAccount(account: Account): Promise<void> {
           class="flex items-center gap-2 rounded border border-[#30363d] bg-[#21262d] px-4 py-2 text-sm font-medium text-gray-200 transition hover:bg-[#30363d] disabled:opacity-50"
           type="button"
           :disabled="pendingAction !== ''"
+          :aria-busy="pendingAction === 'chrome-discover'"
           @click="openChromeImport"
         >
           <UiIcon name="accounts" :size="15" />
@@ -324,6 +344,7 @@ async function removeAccount(account: Account): Promise<void> {
               class="rounded border border-[#30363d] bg-[#21262d] px-3 py-1 text-xs text-gray-300 transition hover:bg-[#30363d] disabled:opacity-50"
               type="button"
               :disabled="pendingAction !== ''"
+              :aria-busy="pendingAction === `toggle:${account.id}`"
               @click="toggleAccount(account)"
             >
               {{ t(account.enabled ? 'common.disable' : 'common.enable') }}
@@ -333,6 +354,7 @@ async function removeAccount(account: Account): Promise<void> {
               class="rounded bg-green-600 px-3 py-1 text-xs text-white transition hover:bg-green-500 disabled:opacity-50"
               type="button"
               :disabled="pendingAction !== '' || !account.enabled"
+              :aria-busy="pendingAction === `login:${account.id}`"
               @click="runAccountAction(account, 'login')"
             >
               {{ t('common.relogin') }}
@@ -341,6 +363,7 @@ async function removeAccount(account: Account): Promise<void> {
               class="rounded border border-[#30363d] bg-[#21262d] px-3 py-1 text-xs text-gray-300 transition hover:bg-[#30363d] disabled:opacity-50"
               type="button"
               :disabled="pendingAction !== '' || !account.enabled"
+              :aria-busy="pendingAction === `verify:${account.id}`"
               @click="runAccountAction(account, 'verify')"
             >
               {{ t('common.verify') }}
@@ -349,6 +372,7 @@ async function removeAccount(account: Account): Promise<void> {
               class="rounded border border-red-900/50 bg-red-900/30 px-3 py-1 text-xs text-red-400 transition hover:bg-red-900/50 disabled:opacity-50"
               type="button"
               :disabled="pendingAction !== ''"
+              :aria-busy="pendingAction === `delete:${account.id}`"
               @click="removeAccount(account)"
             >
               {{ t('common.delete') }}
@@ -426,6 +450,7 @@ async function removeAccount(account: Account): Promise<void> {
               class="flex-1 rounded bg-blue-600 py-2 text-sm text-white transition hover:bg-blue-500 disabled:opacity-50"
               type="submit"
               :disabled="pendingAction !== ''"
+              :aria-busy="pendingAction.startsWith('edit:')"
             >
               {{ t('common.save') }}
             </button>
@@ -497,6 +522,7 @@ async function removeAccount(account: Account): Promise<void> {
               class="flex-1 rounded bg-blue-600 py-2 text-sm text-white transition hover:bg-blue-500 disabled:opacity-50"
               type="submit"
               :disabled="pendingAction !== ''"
+              :aria-busy="pendingAction === 'browser-login'"
             >
               {{ t('accounts.browserLogin') }}
             </button>
@@ -558,17 +584,26 @@ async function removeAccount(account: Account): Promise<void> {
           <div v-if="chromeProfiles.length === 0" class="py-8 text-center text-sm text-gray-500">
             {{ t('accounts.chromeEmpty') }}
           </div>
-          <div v-else class="max-h-[50vh] space-y-2 overflow-auto">
+          <div v-else class="mb-2 flex justify-end">
+            <button
+              class="text-xs text-blue-400 transition hover:text-blue-300"
+              type="button"
+              @click="toggleAllChromeProfiles"
+            >
+              {{ allChromeProfilesSelected ? t('accounts.deselectAll') : t('accounts.selectAll') }}
+            </button>
+          </div>
+          <div v-if="chromeProfiles.length > 0" class="max-h-[50vh] space-y-2 overflow-auto">
             <label
               v-for="profile in chromeProfiles"
-              :key="profile.profile"
+              :key="profile.id"
               class="flex cursor-pointer items-start gap-3 rounded border border-[#30363d] bg-[#0d1117] p-3 transition hover:border-[#4b5563]"
             >
               <input
                 v-model="selectedChromeProfiles"
                 class="mt-1 h-4 w-4 shrink-0 accent-blue-600"
                 type="checkbox"
-                :value="profile.profile"
+                :value="profile.id"
               />
               <span class="min-w-0 flex-1">
                 <strong class="block truncate text-sm text-white">{{ profile.email }}</strong>
@@ -592,6 +627,7 @@ async function removeAccount(account: Account): Promise<void> {
               class="flex-1 rounded bg-blue-600 py-2 text-sm text-white transition hover:bg-blue-500 disabled:opacity-50"
               type="submit"
               :disabled="pendingAction !== '' || selectedChromeProfiles.length === 0"
+              :aria-busy="pendingAction === 'chrome-import'"
             >
               {{ t('accounts.importSelected') }}
             </button>

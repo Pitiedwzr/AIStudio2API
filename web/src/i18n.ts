@@ -1,6 +1,6 @@
 import { readonly, ref } from 'vue'
 import { legacyLocales } from '@/legacy-locales'
-import type { Locale } from '@/types'
+import type { Locale, UpstreamChannel } from '@/types'
 
 const zhCN = {
   'app.title': 'AI Studio 控制台',
@@ -65,7 +65,12 @@ const zhCN = {
   'accounts.chromeTitle': '选择 Chrome 账户',
   'accounts.chromeEmpty': '没有可导入的 Chrome 账户',
   'accounts.importSelected': '导入所选账户',
+  'accounts.selectAll': '全选',
+  'accounts.deselectAll': '取消全选',
   'accounts.loginComplete': '账户登录完成',
+  'accounts.verified': '账户验证通过',
+  'accounts.saved': '账户已保存',
+  'accounts.deleted': '账户已删除',
   'accounts.importComplete': '已导入 {count} 个账户',
   'accounts.editTitle': '编辑账户',
   'accounts.deleteConfirm': '确认删除此账户？',
@@ -130,6 +135,18 @@ const zhCN = {
   'settings.routingFillFirst': '账号粘性优先',
   'settings.routingHelp':
     '轮询依次分配请求；粘性优先持续使用首个可用账户，达到并发上限或不可用时切换。',
+  'settings.waaBackend': 'WAA 后端',
+  'settings.waaBackendCamoufox': 'Camoufox 浏览器',
+  'settings.waaBackendGo': '纯 Go',
+  'settings.waaBackendHelp':
+    'Camoufox 在后台浏览器页面中运行 WAA；纯 Go 在服务进程内运行 WAA，不下载也不启动 Camoufox。登录账户始终需要浏览器。切换后重启生成服务生效。',
+  'settings.upstreamChannels': '上游通道',
+  'settings.upstreamChannelsHelp':
+    'Playground 与 Build 是同一账户的两份独立额度，同时启用时按账户与通道组合调度，一个通道冷却后由另一个通道继续；至少启用一个。',
+  'channel.playground': 'Playground',
+  'channel.build': 'Build',
+  'logs.channel': '通道',
+  'models.channels': '通道',
   'settings.temporaryChat': 'WAA 预热使用临时对话',
   'settings.activeValue': '当前生效',
   'settings.pendingService': '已保存值将在下次生成服务启动时生效',
@@ -250,7 +267,12 @@ const en: Record<TranslationKey, string> = {
   'accounts.chromeTitle': 'Select Chrome accounts',
   'accounts.chromeEmpty': 'No Chrome accounts are available to import',
   'accounts.importSelected': 'Import selected',
+  'accounts.selectAll': 'Select all',
+  'accounts.deselectAll': 'Deselect all',
   'accounts.loginComplete': 'Account login complete',
+  'accounts.verified': 'Account verified',
+  'accounts.saved': 'Account saved',
+  'accounts.deleted': 'Account deleted',
   'accounts.importComplete': 'Imported {count} accounts',
   'accounts.editTitle': 'Edit account',
   'accounts.deleteConfirm': 'Delete this account?',
@@ -315,6 +337,18 @@ const en: Record<TranslationKey, string> = {
   'settings.routingFillFirst': 'Fill first',
   'settings.routingHelp':
     'Round robin rotates requests. Fill first keeps using the first available account until it is unavailable or reaches its concurrency limit.',
+  'settings.waaBackend': 'WAA backend',
+  'settings.waaBackendCamoufox': 'Camoufox browser',
+  'settings.waaBackendGo': 'Pure Go',
+  'settings.waaBackendHelp':
+    'Camoufox runs WAA in a background browser page. Pure Go runs WAA inside the service process and neither downloads nor starts Camoufox. Account login always needs a browser. Restart the generation service to apply a change.',
+  'settings.upstreamChannels': 'Upstream channels',
+  'settings.upstreamChannelsHelp':
+    'Playground and Build are two independent quotas of the same account. With both enabled, requests are scheduled per account and channel, and the other channel continues when one cools down. Enable at least one.',
+  'channel.playground': 'Playground',
+  'channel.build': 'Build',
+  'logs.channel': 'Channel',
+  'models.channels': 'Channels',
   'settings.temporaryChat': 'Use temporary chat for WAA prewarming',
   'settings.activeValue': 'Active',
   'settings.pendingService': 'Saved values apply the next time the generation service starts',
@@ -437,6 +471,11 @@ function legacyTranslation(value: Locale, key: string): string | undefined {
     current = (current as Record<string, unknown>)[part]
   }
   return typeof current === 'string' ? current : undefined
+}
+
+// channelLabelKey 返回上游通道的翻译键
+export function channelLabelKey(channel: UpstreamChannel): TranslationKey {
+  return channel === 'build' ? 'channel.build' : 'channel.playground'
 }
 
 // useI18n 提供旧控制台语言与新增字段翻译

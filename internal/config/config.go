@@ -38,8 +38,19 @@ var configKeys = [...]string{
 	"WARM_STARTUP_CONCURRENCY",
 	"PER_ACCOUNT_CONCURRENCY",
 	"ROUTING_STRATEGY",
+	"UPSTREAM_CHANNELS",
 	"TEMPORARY_CHAT",
+	"WAA_BACKEND",
 }
+
+// upstreamChannels 表示生成请求可启用的上游通道
+var upstreamChannels = []string{"playground", "build"}
+
+// WAABackendCamoufox 表示由 Camoufox 页面承担 WAA 生命周期
+const WAABackendCamoufox = "camoufox"
+
+// WAABackendGo 表示由纯 Go VM 承担 WAA 生命周期
+const WAABackendGo = "go"
 
 // Config 保存服务的全局配置
 type Config struct {
@@ -55,7 +66,9 @@ type Config struct {
 	WarmStartupConcurrency int           `json:"warm_startup_concurrency"`
 	PerAccountConcurrency  int           `json:"per_account_concurrency"`
 	RoutingStrategy        string        `json:"routing_strategy"`
+	UpstreamChannels       []string      `json:"upstream_channels"`
 	TemporaryChat          bool          `json:"temporary_chat"`
+	WAABackend             string        `json:"waa_backend"`
 }
 
 // Default 返回可直接启动的默认配置
@@ -70,6 +83,8 @@ func Default() Config {
 		WarmStartupConcurrency: defaultWarmConcurrency,
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		RoutingStrategy:        "round-robin",
+		UpstreamChannels:       append([]string(nil), upstreamChannels...),
+		WAABackend:             WAABackendCamoufox,
 	}
 }
 
@@ -143,11 +158,17 @@ func Load(path string) (Config, error) {
 	if value, ok := values["ROUTING_STRATEGY"]; ok {
 		cfg.RoutingStrategy = strings.TrimSpace(value)
 	}
+	if value, ok := values["UPSTREAM_CHANNELS"]; ok {
+		cfg.UpstreamChannels = ParseUpstreamChannels(value)
+	}
 	if value, ok := values["TEMPORARY_CHAT"]; ok {
 		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
 			return Config{}, fmt.Errorf("TEMPORARY_CHAT 必须是 true 或 false")
 		}
+	}
+	if value, ok := values["WAA_BACKEND"]; ok {
+		cfg.WAABackend = strings.ToLower(strings.TrimSpace(value))
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -173,7 +194,9 @@ func (c Config) Save(path string) error {
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
 		"PER_ACCOUNT_CONCURRENCY":  strconv.Itoa(c.PerAccountConcurrency),
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
+		"UPSTREAM_CHANNELS":        strings.Join(c.UpstreamChannels, ","),
 		"TEMPORARY_CHAT":           strconv.FormatBool(c.TemporaryChat),
+		"WAA_BACKEND":              c.WAABackend,
 	}
 
 	var output strings.Builder
@@ -218,6 +241,45 @@ func (c Config) Validate() error {
 	if c.RoutingStrategy != "round-robin" && c.RoutingStrategy != "fill-first" {
 		return fmt.Errorf("ROUTING_STRATEGY 必须是 round-robin 或 fill-first")
 	}
+	if err := validateUpstreamChannels(c.UpstreamChannels); err != nil {
+		return err
+	}
+	if c.WAABackend != WAABackendCamoufox && c.WAABackend != WAABackendGo {
+		return fmt.Errorf("WAA_BACKEND 必须是 camoufox 或 go")
+	}
+	return nil
+}
+
+// ParseUpstreamChannels 把逗号分隔的通道列表拆成去空白的小写名称
+func ParseUpstreamChannels(value string) []string {
+	var channels []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.ToLower(strings.TrimSpace(item)); item != "" {
+			channels = append(channels, item)
+		}
+	}
+	return channels
+}
+
+// validateUpstreamChannels 要求至少一个已知且不重复的上游通道
+func validateUpstreamChannels(channels []string) error {
+	if len(channels) == 0 {
+		return fmt.Errorf("UPSTREAM_CHANNELS 至少包含 playground 或 build")
+	}
+	seen := make(map[string]struct{}, len(channels))
+	for _, channel := range channels {
+		known := false
+		for _, candidate := range upstreamChannels {
+			known = known || channel == candidate
+		}
+		if !known {
+			return fmt.Errorf("UPSTREAM_CHANNELS 只能包含 playground 与 build")
+		}
+		if _, exists := seen[channel]; exists {
+			return fmt.Errorf("UPSTREAM_CHANNELS 通道 %s 重复", channel)
+		}
+		seen[channel] = struct{}{}
+	}
 	return nil
 }
 
@@ -236,7 +298,9 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		WarmStartupConcurrency int    `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int    `json:"per_account_concurrency"`
 		RoutingStrategy        string `json:"routing_strategy"`
-		TemporaryChat          bool   `json:"temporary_chat"`
+		UpstreamChannels       []string `json:"upstream_channels"`
+		TemporaryChat          bool     `json:"temporary_chat"`
+		WAABackend             string   `json:"waa_backend"`
 	}
 	return json.Marshal(payload{
 		AuthStates:             c.AuthStates,
@@ -251,7 +315,9 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		WarmStartupConcurrency: c.WarmStartupConcurrency,
 		PerAccountConcurrency:  c.PerAccountConcurrency,
 		RoutingStrategy:        c.RoutingStrategy,
+		UpstreamChannels:       c.UpstreamChannels,
 		TemporaryChat:          c.TemporaryChat,
+		WAABackend:             c.WAABackend,
 	})
 }
 
@@ -270,7 +336,9 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		WarmStartupConcurrency int    `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int    `json:"per_account_concurrency"`
 		RoutingStrategy        string `json:"routing_strategy"`
-		TemporaryChat          bool   `json:"temporary_chat"`
+		UpstreamChannels       []string `json:"upstream_channels"`
+		TemporaryChat          bool     `json:"temporary_chat"`
+		WAABackend             string   `json:"waa_backend"`
 	}
 	var value payload
 	if err := json.Unmarshal(data, &value); err != nil {
@@ -297,7 +365,9 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		RoutingStrategy:        value.RoutingStrategy,
+		UpstreamChannels:       value.UpstreamChannels,
 		TemporaryChat:          value.TemporaryChat,
+		WAABackend:             strings.ToLower(strings.TrimSpace(value.WAABackend)),
 	}
 	if err := parsed.Validate(); err != nil {
 		return err

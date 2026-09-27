@@ -108,6 +108,9 @@ func (s *server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		if len(model.AccessModes) > 0 {
 			item["access_modes"] = model.AccessModes
 		}
+		if len(model.Channels) > 0 {
+			item["channels"] = model.Channels
+		}
 		if model.Paid {
 			item["paid"] = true
 		}
@@ -132,6 +135,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	s.thoughtSignatures.Restore(generateRequest.Contents)
 	events, err := s.service.Generate(r.Context(), generateRequest)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
@@ -151,6 +155,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	s.thoughtSignatures.Remember(result.toolCalls)
 	writeJSON(w, http.StatusOK, buildChatCompletion(requestID, created, request.Model, result))
 }
 
@@ -684,6 +689,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 				return nil
 			}
 			call := event.ToolCall
+			s.thoughtSignatures.Remember([]aistudio.FunctionCall{*call})
 			toolCall := map[string]any{
 				"index": toolIndex,
 				"id":    call.ID,

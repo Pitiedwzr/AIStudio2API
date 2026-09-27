@@ -27,6 +27,7 @@ type accessLogMetadata struct {
 	generation      bool
 	model           string
 	account         string
+	channel         string
 	finishReason    string
 	err             string
 	canceled        bool
@@ -51,6 +52,7 @@ type accessLogSnapshot struct {
 	generation      bool
 	model           string
 	account         string
+	channel         string
 	finishReason    string
 	requestErr      string
 	canceled        bool
@@ -129,7 +131,7 @@ func (metadata *accessLogMetadata) start(force bool) {
 	metadata.started = true
 	admin := metadata.admin
 	entry := AccessLog{
-		Method: metadata.method, Path: metadata.path, Model: metadata.model, Account: metadata.account,
+		Method: metadata.method, Path: metadata.path, Model: metadata.model, Account: metadata.account, Channel: metadata.channel,
 		Temperature: metadata.temperature, TopP: metadata.topP, Thinking: metadata.thinking,
 		MaxOutputTokens: metadata.maxOutputTokens, Generation: metadata.generation, RequestID: metadata.requestID,
 		InputMessages: metadata.inputMessages, InputTextChars: metadata.inputTextChars,
@@ -243,7 +245,7 @@ func (metadata *accessLogMetadata) snapshot() accessLogSnapshot {
 	metadata.mu.Lock()
 	snapshot := accessLogSnapshot{
 		generation: metadata.generation,
-		model:      metadata.model, account: metadata.account, finishReason: metadata.finishReason,
+		model:      metadata.model, account: metadata.account, channel: metadata.channel, finishReason: metadata.finishReason,
 		requestErr: metadata.err, canceled: metadata.canceled,
 		failureStatus: metadata.failureStatus,
 		firstEvent:    metadata.firstEvent,
@@ -323,6 +325,15 @@ func SetAccessLogTarget(ctx context.Context, model string, account string) {
 	}
 }
 
+// SetAccessLogChannel 写入请求实际使用的上游通道
+func SetAccessLogChannel(ctx context.Context, channel string) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.channel = strings.TrimSpace(channel)
+		metadata.mu.Unlock()
+	}
+}
+
 // SetAccessLogError 写入请求最终错误
 func SetAccessLogError(ctx context.Context, err error) {
 	if err == nil {
@@ -377,7 +388,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 				Temperature: snapshot.temperature, TopP: snapshot.topP,
 				Thinking: snapshot.thinking, MaxOutputTokens: snapshot.maxOutputTokens,
 				RequestID: snapshot.requestID,
-				Method:    r.Method, Path: r.URL.Path, Model: snapshot.model, Account: snapshot.account,
+				Method:    r.Method, Path: r.URL.Path, Model: snapshot.model, Account: snapshot.account, Channel: snapshot.channel,
 				FinishReason: snapshot.finishReason, Error: snapshot.requestErr,
 				Canceled: snapshot.canceled, Generation: snapshot.generation,
 			})
@@ -407,10 +418,56 @@ func corsMiddleware(next http.Handler) http.Handler {
 func loopbackMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil || !net.ParseIP(host).IsLoopback() {
+		if err != nil || !net.ParseIP(host).IsLoopback() || !loopbackHost(r.Host) {
 			writeAdminError(w, http.StatusForbidden, "control_plane_forbidden", "Control plane is only available from loopback")
 			return
 		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loopbackHost 判断 Host 或 Origin 主机名是否为 localhost 或回环地址
+func loopbackHost(host string) bool {
+	name := host
+	if hostname, _, err := net.SplitHostPort(host); err == nil {
+		name = hostname
+	}
+	name = strings.Trim(name, "[]")
+	if strings.EqualFold(name, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(name)
+	return ip != nil && ip.IsLoopback()
+}
+
+// browserOriginMiddleware 在未配置 API key 时拒绝外部网页与 null 来源的浏览器请求
+func browserOriginMiddleware(requiredKey string, next http.Handler) http.Handler {
+	if strings.TrimSpace(requiredKey) != "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originValue := strings.TrimSpace(r.Header.Get("Origin"))
+		if originValue == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		origin, err := url.Parse(originValue)
+		webOrigin := err != nil || originValue == "null" || origin.Scheme == "http" || origin.Scheme == "https"
+		if webOrigin && (err != nil || !loopbackHost(origin.Host)) {
+			writeAuthError(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// maxPublicBodyBytes 为公开接口请求体上限，可容纳 Base64 编码后的最大文件
+const maxPublicBodyBytes = openAIFileMaxBytes/3*4 + openAIFileRequestOverhead
+
+// bodyLimitMiddleware 限制公开接口请求体大小
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxPublicBodyBytes)
 		next.ServeHTTP(w, r)
 	})
 }
