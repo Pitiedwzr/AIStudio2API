@@ -57,12 +57,12 @@ func writeSSE(w http.ResponseWriter, event string, payload any) error {
 	if err != nil {
 		return err
 	}
+	frame := make([]byte, 0, len(event)+len(data)+16)
 	if event != "" {
-		if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
-			return err
-		}
+		frame = append(append(append(frame, "event: "...), event...), '\n')
 	}
-	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+	frame = append(append(append(frame, "data: "...), data...), "\n\n"...)
+	if _, err := w.Write(frame); err != nil {
 		return err
 	}
 	return http.NewResponseController(w).Flush()
@@ -162,7 +162,7 @@ func writeAuthError(w http.ResponseWriter, r *http.Request) {
 
 func protocolForRequest(r *http.Request) string {
 	switch {
-	case strings.HasPrefix(r.URL.Path, "/v1beta/"):
+	case strings.HasPrefix(r.URL.Path, "/v1beta/"), r.URL.Path == "/v1/interactions":
 		return "gemini"
 	case strings.HasPrefix(r.URL.Path, "/v1/messages"), r.Header.Get("Anthropic-Version") != "":
 		return "anthropic"

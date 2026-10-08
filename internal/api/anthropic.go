@@ -82,12 +82,8 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if request.Model == "" || len(request.Messages) == 0 || request.MaxTokens == nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "model, messages and max_tokens are required")
-		return
-	}
-	if request.Messages[len(request.Messages)-1].Role == "assistant" {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "assistant prefill is not supported by the AI Studio upstream")
+	if request.Model == "" {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
 	messageID := newID("msg")
@@ -98,6 +94,17 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	generateRequest, err := request.toGenerateRequest(messageID)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	generateRequest.Unary = !request.Stream
+	events, err := s.service.Generate(r.Context(), generateRequest)
+	if err == nil && request.Stream {
+		events, err = awaitStreamStart(r.Context(), events)
+	}
+	if err != nil {
+		if shouldWriteRequestError(r, err) {
+			writeAnthropicError(w, statusFromError(err), anthropicErrorType(err), err.Error())
+		}
 		return
 	}
 	if request.Stream {
@@ -112,21 +119,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if err := writer.start(); err != nil {
 			return
 		}
-		events, err := s.service.Generate(r.Context(), generateRequest)
-		if err != nil {
-			if shouldWriteRequestError(r, err) {
-				_ = writer.error(err)
-			}
-			return
-		}
 		s.streamAnthropic(r, writer, events)
-		return
-	}
-	events, err := s.service.Generate(r.Context(), generateRequest)
-	if err != nil {
-		if shouldWriteRequestError(r, err) {
-			writeAnthropicError(w, statusFromError(err), anthropicErrorType(err), err.Error())
-		}
 		return
 	}
 	result, err := consumeEvents(r.Context(), events, nil)
@@ -145,8 +138,8 @@ func (s *server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if request.Model == "" || len(request.Messages) == 0 {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "model and messages are required")
+	if request.Model == "" {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
 	if err := s.decodeAnthropicSearchHistory(&request); err != nil {
@@ -180,9 +173,8 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 			}
 		case "adaptive":
 		case "disabled":
-			return aistudio.GenerateRequest{}, fmt.Errorf("thinking.type disabled is not supported by the AI Studio upstream")
 		default:
-			return aistudio.GenerateRequest{}, fmt.Errorf("thinking.type must be enabled or adaptive")
+			return aistudio.GenerateRequest{}, fmt.Errorf("thinking.type must be enabled, adaptive or disabled")
 		}
 	}
 	system, err := anthropicSystemText(request.System)
@@ -227,6 +219,10 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 	}
 	if request.Thinking != nil && request.Thinking.Type == "enabled" {
 		config.ThinkingBudget = request.Thinking.BudgetTokens
+	}
+	if request.Thinking != nil && request.Thinking.Type == "disabled" {
+		config.ReasoningEffort = "none"
+		config.HideThinking = true
 	}
 	if request.OutputConfig != nil {
 		config.ReasoningEffort = request.OutputConfig.Effort
@@ -444,20 +440,18 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 			if tool.Name == "" {
 				return aistudio.Tools{}, fmt.Errorf("tool name is required")
 			}
-			if len(tool.Options) > 0 {
-				fields := make([]string, 0, len(tool.Options))
-				for field := range tool.Options {
-					fields = append(fields, field)
+			var strict bool
+			if raw := tool.Options["strict"]; rawJSONConfigured(raw) {
+				if err := json.Unmarshal(raw, &strict); err != nil {
+					return aistudio.Tools{}, fmt.Errorf("tool strict must be a boolean")
 				}
-				sort.Strings(fields)
-				return aistudio.Tools{}, fmt.Errorf("custom tool %q has unsupported option %q", tool.Name, fields[0])
 			}
 			parameters := tool.InputSchema
 			if len(parameters) == 0 {
 				parameters = json.RawMessage(`{"type":"object","properties":{}}`)
 			}
 			mapped.Functions = append(mapped.Functions, aistudio.FunctionDeclaration{
-				Name: tool.Name, Description: tool.Description, Parameters: parameters,
+				Name: tool.Name, Description: tool.Description, Parameters: parameters, Strict: strict,
 			})
 		default:
 			return aistudio.Tools{}, fmt.Errorf("unsupported tool type %q", tool.Type)
@@ -466,9 +460,6 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 	config, err := anthropicToolChoice(choice)
 	if err != nil {
 		return aistudio.Tools{}, err
-	}
-	if len(mapped.Functions) == 0 && len(mapped.Google) == 0 {
-		return mapped, nil
 	}
 	mapped.ToolConfig = config
 	return mapped, nil
@@ -497,24 +488,34 @@ func anthropicToolChoice(raw json.RawMessage) (aistudio.ToolConfig, error) {
 		return aistudio.ToolConfig{Mode: "auto"}, nil
 	}
 	var choice struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type            string `json:"type"`
+		Name            string `json:"name"`
+		DisableParallel *bool  `json:"disable_parallel_tool_use"`
 	}
 	if err := json.Unmarshal(raw, &choice); err != nil {
 		return aistudio.ToolConfig{}, fmt.Errorf("invalid tool_choice: %w", err)
 	}
+	config := aistudio.ToolConfig{}
+	if choice.DisableParallel != nil {
+		parallel := !*choice.DisableParallel
+		config.ParallelCalls = &parallel
+	}
 	switch choice.Type {
 	case "auto":
-		return aistudio.ToolConfig{Mode: "auto"}, nil
+		config.Mode = "auto"
 	case "none":
-		return aistudio.ToolConfig{Mode: "none"}, nil
+		config.Mode = "none"
 	case "any":
-		return aistudio.ToolConfig{}, fmt.Errorf("tool_choice any is not supported by AI Studio Web")
+		config.Mode = "required"
 	case "tool":
-		return aistudio.ToolConfig{}, fmt.Errorf("named tool_choice is not supported by AI Studio Web")
+		if choice.Name == "" {
+			return aistudio.ToolConfig{}, fmt.Errorf("tool_choice name is required")
+		}
+		config.Mode, config.AllowedFunctionNames = "required", []string{choice.Name}
 	default:
 		return aistudio.ToolConfig{}, fmt.Errorf("unsupported tool_choice type %q", choice.Type)
 	}
+	return config, nil
 }
 
 func buildAnthropicResponse(id string, model string, result generationResult, searchKey string) map[string]any {
@@ -650,9 +651,7 @@ func anthropicUsage(usage *aistudio.Usage) map[string]any {
 func writeAnthropicModels(w http.ResponseWriter, models []aistudio.Model) {
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		data = append(data, map[string]any{
-			"id": model.ID, "type": "model", "display_name": model.Name, "created_at": "1970-01-01T00:00:00Z",
-		})
+		data = append(data, anthropicModelObject(model))
 	}
 	response := map[string]any{"data": data, "has_more": false, "first_id": nil, "last_id": nil}
 	if len(models) > 0 {
@@ -660,6 +659,13 @@ func writeAnthropicModels(w http.ResponseWriter, models []aistudio.Model) {
 		response["last_id"] = models[len(models)-1].ID
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// anthropicModelObject 投影列表与单模型共用的 Anthropic 字段
+func anthropicModelObject(model aistudio.Model) map[string]any {
+	return map[string]any{
+		"id": model.ID, "type": "model", "display_name": model.Name, "created_at": "1970-01-01T00:00:00Z",
+	}
 }
 
 type anthropicStreamWriter struct {

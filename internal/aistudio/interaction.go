@@ -141,6 +141,11 @@ func interactionThinkingLevel(config GenerationConfig, defaults GenerationDefaul
 
 // generateInteraction 经 CreateInteractionStream 生成并映射为规范事件
 func (c *Client) generateInteraction(ctx context.Context, request GenerateRequest, entry modelEntry) (<-chan Event, error) {
+	reason := ""
+	if request.Unary {
+		reason = "该模型使用 CreateInteractionStream，收集完成后返回"
+	}
+	reportUpstreamMode(ctx, "CreateInteractionStream", "stream", reason)
 	body, binding, err := EncodeCreateInteractionStreamRequest(request, entry.defaults)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
@@ -167,6 +172,12 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 		defer stopClose()
 		committed := false
 		send := func(event Event) error {
+			if request.Config.HideThinking && event.Kind == EventReasoning {
+				if event.ThoughtSignature == "" {
+					return nil
+				}
+				event.Kind, event.Text = EventThoughtSignature, ""
+			}
 			if !committed {
 				committed = true
 				ready <- nil
@@ -255,14 +266,11 @@ func DecodeInteractionStream(source io.Reader, emit func(Event) error) error {
 			return withMethod(err, "CreateInteractionStream")
 		}
 		if code != 0 {
-			rpcError := &RPCError{Method: "CreateInteractionStream", StatusCode: http.StatusBadGateway, Code: code}
+			statusCode := http.StatusBadGateway
 			if status, ok := interactionStatusHTTP[code]; ok {
-				rpcError.StatusCode = status
+				statusCode = status
 			}
-			if len(status) > 1 {
-				rpcError.Message, _ = rawString(status[1], "$[1][1]", trailing[0])
-			}
-			return rpcError
+			return DecodeRPCError("CreateInteractionStream", statusCode, trailing[0])
 		}
 	}
 	if !finished {

@@ -36,6 +36,9 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	if err != nil {
 		return nil, err
 	}
+	if len(config) > 8 && config[8] != nil {
+		config[8] = projectPlaygroundResponseSchema(config[8].([]any), request.Config.ResponseSchema)
+	}
 	serverSideTools := explicitTools && len(request.Tools.Functions) > 0 && (len(request.Tools.Google) > 0 || request.Tools.GoogleSearch != nil)
 	length := 11
 	if runtime.Timezone != "" || serverSideTools {
@@ -44,8 +47,12 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	wire := make([]any, length)
 	wire[0] = wireModelName(request.Model)
 	wire[1] = contents
-	if !defaults.ImageRoute {
-		wire[2] = observedSafetySettings()
+	safety, err := resolveSafetySettings(request.SafetySettings, defaults.ImageRoute)
+	if err != nil {
+		return nil, err
+	}
+	if len(safety) > 0 {
+		wire[2] = encodeSafetySettings(safety)
 	}
 	wire[3] = config
 	if request.System != "" {
@@ -77,7 +84,7 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	var responseSchema []any
 	var err error
 	if len(config.ResponseSchema) > 0 {
-		responseSchema, err = encodeJSONSchema(config.ResponseSchema)
+		responseSchema, err = encodeResponseSchema(config.ResponseSchema)
 		if err != nil {
 			return nil, fmt.Errorf("response schema: %w", err)
 		}
@@ -174,6 +181,10 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	if err != nil {
 		return nil, err
 	}
+	mediaResolution, err := encodeMediaResolution(config.MediaResolution)
+	if err != nil {
+		return nil, err
+	}
 	includeThinking := defaults.Thinking || defaults.ThinkingBudget || defaults.ThinkingLevel || thinkingBudget != nil || hasReasoningEffort
 	length := 14
 	if responseModalities != nil {
@@ -186,6 +197,9 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 		if length < 17 {
 			length = 17
 		}
+	}
+	if mediaResolution != nil && length < 18 {
+		length = 18
 	}
 	if config.Seed != nil {
 		if length < 19 {
@@ -239,6 +253,9 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 			thinking[1] = *thinkingBudget
 		}
 		wire[16] = thinking
+	}
+	if mediaResolution != nil {
+		wire[17] = mediaResolution
 	}
 	if config.Seed != nil {
 		wire[18] = *config.Seed
@@ -387,12 +404,23 @@ func encodeSpeechConfig(config *SpeechConfig) ([]any, error) {
 	return wire, nil
 }
 
-func applyModelMediaDefaults(config GenerationConfig, model Model) GenerationConfig {
-	if model.Capabilities["image_route"] && imageModalityNeedsText(config.ResponseModalities) {
-		// 图像输出同时请求文本模态
-		config.ResponseModalities = []ResponseModality{ResponseModalityImage, ResponseModalityText}
-		return config
+// mediaResolutions 为 Gemini API 输入媒体分辨率名与 generation config 字段 18 的编号
+var mediaResolutions = map[string]int64{"MEDIA_RESOLUTION_LOW": 1, "MEDIA_RESOLUTION_MEDIUM": 2, "MEDIA_RESOLUTION_HIGH": 3}
+
+// encodeMediaResolution 校验输入媒体分辨率并返回 wire 编号，未设置时为 nil
+func encodeMediaResolution(value string) (any, error) {
+	name := strings.ToUpper(strings.TrimSpace(value))
+	if name == "" || name == "MEDIA_RESOLUTION_UNSPECIFIED" {
+		return nil, nil
 	}
+	code, ok := mediaResolutions[name]
+	if !ok {
+		return nil, fmt.Errorf("mediaResolution %q 不受支持", value)
+	}
+	return code, nil
+}
+
+func applyModelMediaDefaults(config GenerationConfig, model Model) GenerationConfig {
 	if config.ResponseModalities != nil {
 		return config
 	}
@@ -403,26 +431,6 @@ func applyModelMediaDefaults(config GenerationConfig, model Model) GenerationCon
 		config.ResponseModalities = []ResponseModality{ResponseModalityImage, ResponseModalityText}
 	}
 	return config
-}
-
-// imageModalityNeedsText 判断图像模型请求是否缺 TEXT 模态
-func imageModalityNeedsText(modalities []ResponseModality) bool {
-	if modalities == nil {
-		return true
-	}
-	hasImage := false
-	hasText := false
-	for _, modality := range modalities {
-		switch ResponseModality(strings.ToUpper(strings.TrimSpace(string(modality)))) {
-		case ResponseModalityImage:
-			hasImage = true
-		case ResponseModalityText:
-			hasText = true
-		default:
-			return false
-		}
-	}
-	return hasImage && !hasText
 }
 
 func applySpeechTranscript(contents []Content, model Model, config GenerationConfig) []Content {
@@ -535,12 +543,39 @@ func speakerSegments(part Part, pattern *regexp.Regexp) []Part {
 	return result
 }
 
-func observedSafetySettings() []any {
-	settings := make([]any, 0, 4)
-	for category := int64(7); category <= 10; category++ {
-		settings = append(settings, []any{nil, nil, category, int64(5)})
+// validateGenerateRequest 用各账户已载入的模型条目校验请求，任一条目接受即通过，目录未载入时交给生成路径
+func (c *Client) validateGenerateRequest(request GenerateRequest) error {
+	var first error
+	for _, entry := range c.cachedModelEntries(request.Model) {
+		err := validateGenerateEntry(request, entry)
+		if err == nil {
+			return nil
+		}
+		if first == nil {
+			first = err
+		}
 	}
-	return settings
+	return first
+}
+
+// validateGenerateEntry 按 Generate 的顺序校验工具、转写、生成参数与安全设置
+func validateGenerateEntry(request GenerateRequest, entry modelEntry) error {
+	if err := validateRequestedTools(request.Tools, entry.model); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if err := validateTranscriptionConfig(request.Config.TranscriptionConfig, entry.model); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if entry.defaults.InteractionStream {
+		return nil
+	}
+	if _, err := encodeGenerationConfig(applyModelMediaDefaults(request.Config, entry.model), entry.defaults); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if _, err := resolveSafetySettings(request.SafetySettings, entry.defaults.ImageRoute); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	return nil
 }
 
 func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan Event, error) {
@@ -561,6 +596,12 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	}
 	if err := validateTranscriptionConfig(request.Config.TranscriptionConfig, entry.model); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if request.Truncate && entry.model.InputTokenLimit > 0 {
+		request, err = c.truncateRequest(ctx, request, entry.model.InputTokenLimit)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if entry.defaults.InteractionStream && !build {
 		return c.generateInteraction(ctx, request, entry)
@@ -632,6 +673,12 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				return nil
 			default:
 				output.observe(event)
+				if request.Config.HideThinking && event.Kind == EventReasoning {
+					if event.ThoughtSignature == "" {
+						return nil
+					}
+					event.Kind, event.Text = EventThoughtSignature, ""
+				}
 				return send(event)
 			}
 		}
@@ -713,8 +760,43 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	return events, nil
 }
 
+// truncateRequest 按权威计数删除最早的完整对话轮次
+func (c *Client) truncateRequest(ctx context.Context, request GenerateRequest, limit int64) (GenerateRequest, error) {
+	for {
+		count, err := c.CountTokensForAccount(ctx, request.AccountID, TokenCountRequest{
+			Model: request.Model, System: request.System, Contents: request.Contents, Tools: request.Tools,
+		})
+		if err != nil {
+			return request, err
+		}
+		if count.InputTokens <= limit {
+			return request, nil
+		}
+		start := nextConversationTurn(request.Contents)
+		if start < 0 {
+			return request, fmt.Errorf("%w: 最新对话轮次超过模型上下文窗口 %d", ErrInvalidArgument, limit)
+		}
+		request.Contents = request.Contents[start:]
+	}
+}
+
+// nextConversationTurn 查找保留工具调用与结果配对的下一轮用户消息
+func nextConversationTurn(contents []Content) int {
+	for index := 1; index < len(contents); index++ {
+		if contents[index].Role == RoleUser && !slices.ContainsFunc(contents[index].Parts, func(part Part) bool { return part.FunctionResult != nil }) {
+			return index
+		}
+	}
+	return -1
+}
+
 // sendPlayground 编码并发送 Playground GenerateContent，返回响应与含完成帧校验的流解码
 func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, entry modelEntry) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
+	reason := ""
+	if request.Unary {
+		reason = "Playground GenerateContent 使用服务端流，收集完成后返回"
+	}
+	reportUpstreamMode(ctx, "GenerateContent", "stream", reason)
 	runtime := RequestContext{}
 	if c.contextProvider != nil {
 		var err error

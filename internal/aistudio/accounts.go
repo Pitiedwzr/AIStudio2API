@@ -10,8 +10,10 @@ import (
 	"net/http"
 	"net/mail"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -214,6 +216,8 @@ type AccountSelection struct {
 	ResourceID        string
 	AllowedAccountIDs []string
 	PlaygroundOnly    bool
+	Channel           Channel
+	PreferredChannel  Channel
 }
 
 const preferredBootstrapModelID = "gemini-flash-latest"
@@ -1337,9 +1341,6 @@ func (l *AccountLease) markAuthenticationStateAt(required bool, reason string, c
 		checkedAt.Before(l.account.authCheckedAt) {
 		return nil
 	}
-	if required && checkedAt.Equal(l.account.authCheckedAt) && l.account.State == AccountReady {
-		return nil
-	}
 	l.account.authCheckedAt = checkedAt
 	if !l.account.Config.Enabled {
 		l.account.State = AccountDisabled
@@ -1388,8 +1389,35 @@ func (l *AccountLease) SaveStorageState(state StorageState) error {
 	}
 	l.pool.mu.Lock()
 	l.account.StorageState = state
+	l.account.authGeneration++
+	l.authGeneration = l.account.authGeneration
+	l.account.authCheckedAt = time.Time{}
 	l.pool.mu.Unlock()
 	return nil
+}
+
+// WaitForAuthRefresh 等待其他正常请求释放并复用已经提交的新认证
+func (l *AccountLease) WaitForAuthRefresh(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		l.operation.Lock()
+		generation := l.authGeneration
+		l.operation.Unlock()
+		l.pool.mu.Lock()
+		ready := l.exclusive || generation != l.account.authGeneration || l.account.active <= l.account.authRefreshers
+		changed := l.pool.changed
+		l.pool.mu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
 // RefreshStorageState 保证并发认证失效只提交一次
@@ -2197,7 +2225,7 @@ func (p *AccountPool) Status() []AccountStatus {
 		_, active := accountCooldown(account, "", now)
 		if !account.Config.Enabled {
 			state = AccountDisabled
-		} else if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0 {
+		} else if state == AccountReady && (account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0) {
 			state = AccountBusy
 		} else if state == AccountReady && active {
 			state = AccountCooldown
@@ -2349,6 +2377,9 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 				}
 				continue
 			}
+		}
+		if candidate.channel != selection.PreferredChannel && p.preferredChannelOpenLocked(account, selection, now) {
+			continue
 		}
 		refreshRuntime := false
 		if account.active == 0 {
@@ -2581,6 +2612,9 @@ func (p *AccountPool) setAccountState(accountID string, state AccountState, reas
 		account.State = state
 	}
 	account.stateMessage = strings.TrimSpace(reason)
+	if state == AccountReady || state == AccountAuthRequired {
+		account.authCheckedAt = time.Now().UTC()
+	}
 	p.notifyLocked()
 	return nil
 }
@@ -3242,7 +3276,7 @@ func AcquireAccountRuntimeLease(accountID string) (*AccountRuntimeLease, error) 
 	if err != nil {
 		return nil, err
 	}
-	cacheRoot, err := os.UserCacheDir()
+	cacheRoot, err := userCacheRoot()
 	if err != nil {
 		return nil, fmt.Errorf("读取用户缓存目录: %w", err)
 	}
@@ -3259,6 +3293,28 @@ func AcquireAccountRuntimeLease(accountID string) (*AccountRuntimeLease, error) 
 		return nil, fmt.Errorf("%w: %s 已由另一个 AIStudio2API runtime 使用", ErrAccountLeased, accountID)
 	}
 	return &AccountRuntimeLease{lock: lock}, nil
+}
+
+// userCacheRoot 返回当前用户的缓存目录，目录环境变量缺失时按系统账户主目录推导同一位置
+func userCacheRoot() (string, error) {
+	if directory, err := os.UserCacheDir(); err == nil {
+		return directory, nil
+	}
+	current, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(current.HomeDir) {
+		return "", fmt.Errorf("当前用户主目录无效: %q", current.HomeDir)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		return filepath.Join(current.HomeDir, "AppData", "Local"), nil
+	case "darwin", "ios":
+		return filepath.Join(current.HomeDir, "Library", "Caches"), nil
+	default:
+		return filepath.Join(current.HomeDir, ".cache"), nil
+	}
 }
 
 // Release 释放账户 WAA runtime 锁

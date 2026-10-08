@@ -94,12 +94,39 @@ func generationChannelSelection(selection AccountSelection) bool {
 		strings.TrimSpace(selection.Capability) == "" && !selection.PlaygroundOnly
 }
 
-// selectionChannelsLocked 返回选择可使用的通道顺序；非生成请求只使用 Playground RPC
+// selectionChannelsLocked 返回选择可使用的通道顺序，优先通道排在首位；非生成请求只使用 Playground RPC
 func (p *AccountPool) selectionChannelsLocked(selection AccountSelection) []Channel {
 	if !generationChannelSelection(selection) {
 		return []Channel{ChannelPlayground}
 	}
-	return p.enabledChannelsLocked()
+	if selection.Channel != "" {
+		if p.channelEnabledLocked(selection.Channel) {
+			return []Channel{selection.Channel}
+		}
+		return nil
+	}
+	channels := p.enabledChannelsLocked()
+	if selection.PreferredChannel == "" || !slices.Contains(channels, selection.PreferredChannel) {
+		return channels
+	}
+	ordered := []Channel{selection.PreferredChannel}
+	for _, channel := range channels {
+		if channel != selection.PreferredChannel {
+			ordered = append(ordered, channel)
+		}
+	}
+	return ordered
+}
+
+// preferredChannelOpenLocked 判断账户的优先通道支持选择且未冷却
+func (p *AccountPool) preferredChannelOpenLocked(account *Account, selection AccountSelection, now time.Time) bool {
+	preferred := selection.PreferredChannel
+	if preferred == "" || !slices.Contains(p.selectionChannelsLocked(selection), preferred) ||
+		!p.channelSupportsLocked(account, preferred, selection) {
+		return false
+	}
+	_, cooling := accountCooldown(account, ChannelCooldownScope(preferred, selectionAccessScope(selection)), now)
+	return !cooling
 }
 
 // channelSupportsLocked 判断账户的通道目录是否支持选择

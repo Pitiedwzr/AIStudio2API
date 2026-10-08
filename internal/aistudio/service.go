@@ -11,12 +11,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 )
 
 // PooledService 在账户租约内调用协议客户端
 type PooledService struct {
 	pool   *AccountPool
 	client *Client
+	// BuildNativeNonstream 让非流式请求优先使用具备资格的 Build 通道
+	BuildNativeNonstream bool
 }
 
 // PoolRequestContextProvider 从租约账户读取协议上下文
@@ -407,8 +411,12 @@ func (s *PooledService) cachedModels(accountID string) []Model {
 
 // DefinitiveAuthenticationFailure 判断上游是否明确要求重新认证
 func DefinitiveAuthenticationFailure(err error) bool {
+	if errors.Is(err, camoufoxnative.ErrAuthenticationRequired) {
+		return true
+	}
 	var rpcError *RPCError
-	return errors.As(err, &rpcError) && rpcError.StatusCode == 401
+	return errors.As(err, &rpcError) && !driveAuthorizationMissing(err) &&
+		(rpcError.StatusCode == http.StatusUnauthorized || rpcError.Code == 16)
 }
 
 // DefinitiveWAARuntimeFailure 判断上游是否明确拒绝当前 WAA 运行态
@@ -494,6 +502,10 @@ func (s *PooledService) CountTokens(ctx context.Context, request TokenCountReque
 	if modelID == "" {
 		return TokenCount{}, fmt.Errorf("%w: CountTokens model 不能为空", ErrInvalidArgument)
 	}
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
+	if len(request.Contents) == 0 {
+		return TokenCount{}, fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
+	}
 	modelAccessScope := ModelAccessKey("count-tokens", modelID)
 	selection := AccountSelection{ModelID: modelID, ModelAccessScope: modelAccessScope, Method: "countTokens"}
 	var count TokenCount
@@ -540,11 +552,35 @@ func (s *PooledService) CountTokens(ctx context.Context, request TokenCountReque
 	return count, requestErr
 }
 
+// ValidateGenerateRequest 在选择账户前校验与上游通道无关的生成参数
+func (s *PooledService) ValidateGenerateRequest(request GenerateRequest) error {
+	if strings.TrimPrefix(strings.TrimSpace(request.Model), "models/") == "" {
+		return fmt.Errorf("%w: GenerateContent model 不能为空", ErrInvalidArgument)
+	}
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
+	if len(request.Contents) == 0 {
+		return fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
+	}
+	request, _, err := prepareToolRequest(request)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	return s.client.validateGenerateRequest(request)
+}
+
 // Generate 使用支持目标模型的独占账户生成事件流
 func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (<-chan Event, error) {
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
 	if modelID == "" {
 		return nil, fmt.Errorf("%w: GenerateContent model 不能为空", ErrInvalidArgument)
+	}
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
+	if len(request.Contents) == 0 {
+		return nil, fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
+	}
+	request, contract, err := prepareToolRequest(request)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 	resourceID, err := s.pool.ResourceIDForContents(ctx, request.Contents)
 	if err != nil {
@@ -555,6 +591,9 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 		Method:     "generateContent",
 		AccountID:  strings.TrimSpace(request.AccountID),
 		ResourceID: resourceID,
+	}
+	if RequestNeedsBuildSchema(request) || request.Unary && s.BuildNativeNonstream {
+		selection.PreferredChannel = ChannelBuild
 	}
 	pinned := selection.AccountID != "" || selection.ResourceID != ""
 	if _, ok := AccountLeaseFromContext(ctx); ok {
@@ -573,6 +612,7 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 		request.AccountID = accountID
 		events, err := s.client.Generate(ContextWithAccountLease(ctx, lease), request)
 		if err == nil {
+			events = contract.forward(ctx, events)
 			if !owned {
 				return events, nil
 			}
@@ -619,6 +659,9 @@ func accountAttemptLimit(pool *AccountPool, pinned bool) int {
 }
 
 func retryableAccountError(err error) bool {
+	if driveAuthorizationMissing(err) {
+		return false
+	}
 	var rpcError *RPCError
 	if !errors.As(err, &rpcError) {
 		return false
@@ -645,7 +688,7 @@ func forwardEventsWithLease(
 			}
 		}
 	}()
-	verified := false
+	terminal := false
 	accountID := lease.Account().ID
 	accessGeneration := lease.ModelAccessGeneration()
 	checkedAt := lease.CheckedAt()
@@ -660,9 +703,21 @@ func forwardEventsWithLease(
 		case <-ctx.Done():
 			return
 		}
+		if terminal {
+			continue
+		}
 		if event.Kind == EventError {
+			terminal = true
 			if DefinitiveAuthenticationFailure(event.Err) {
 				if err := lease.MarkAuthenticationRequired(event.Err.Error()); err != nil {
+					event.Err = errors.Join(event.Err, err)
+				}
+			} else if cooldown, ok := QuotaCooldownForError(event.Err, time.Now()); ok {
+				scope := lease.CooldownScope(modelID)
+				if cooldown.Global {
+					scope = ""
+				}
+				if err := pool.MarkCooldownIfGeneration(accountID, scope, accessGeneration, checkedAt, cooldown.Until, cooldown.Reason); err != nil {
 					event.Err = errors.Join(event.Err, err)
 				}
 			}
@@ -672,8 +727,8 @@ func forwardEventsWithLease(
 		case <-ctx.Done():
 			return
 		}
-		if event.Kind != EventError && !verified {
-			verified = true
+		if event.Kind == EventFinish {
+			terminal = true
 			if err := lease.MarkAuthenticationValid(); err != nil {
 				slog.Error("账户认证状态保存失败", "account", accountID, "error", err)
 			}

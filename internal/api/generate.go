@@ -80,9 +80,9 @@ func (result *generationResult) apply(event aistudio.Event) error {
 			}
 			media := *event.Media
 			media.Data = append([]byte(nil), media.Data...)
-			if strings.HasPrefix(media.MIME, "audio/") && len(media.Data) > 0 && media.URL == "" && len(result.events) > 0 {
+			if strings.HasPrefix(media.MIME, "audio/l16") && len(media.Data) > 0 && media.URL == "" && len(result.events) > 0 {
 				previous := &result.events[len(result.events)-1]
-				if previous.Kind == aistudio.EventMedia && previous.Media != nil && previous.Media.MIME == media.MIME && previous.Media.URL == "" {
+				if previous.Kind == aistudio.EventMedia && previous.Media != nil && previous.Media.MIME == media.MIME && previous.Media.URL == "" && previous.ThoughtSignature == "" && event.ThoughtSignature == "" {
 					previous.Media.Data = append(previous.Media.Data, media.Data...)
 					result.media[len(result.media)-1].Data = append(result.media[len(result.media)-1].Data, media.Data...)
 					return nil
@@ -98,6 +98,42 @@ func (result *generationResult) apply(event aistudio.Event) error {
 	}
 	result.events = append(result.events, event)
 	return nil
+}
+
+// awaitStreamStart 在写出流式响应头前等待首个事件，首个事件为错误时返回该错误，心跳间隔内没有事件时直接返回原事件流
+func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event) (<-chan aistudio.Event, error) {
+	timer := time.NewTimer(streamHeartbeatInterval)
+	defer timer.Stop()
+	var first aistudio.Event
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return events, nil
+	case event, ok := <-events:
+		if !ok {
+			return nil, errIncompleteStream
+		}
+		if event.Kind == aistudio.EventError {
+			if event.Err != nil {
+				return nil, event.Err
+			}
+			return nil, errUpstreamStream
+		}
+		first = event
+	}
+	replay := make(chan aistudio.Event)
+	go func() {
+		defer close(replay)
+		for event, ok := first, true; ok; event, ok = <-events {
+			select {
+			case replay <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return replay, nil
 }
 
 func consumeEvents(ctx context.Context, events <-chan aistudio.Event, emit func(aistudio.Event) error) (result generationResult, resultErr error) {

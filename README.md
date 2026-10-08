@@ -36,6 +36,7 @@
 ## 特性
 
 - **原生流式响应**: 实时输出正文、思考摘要、函数调用、Google 工具、媒体和 usage
+- **函数工具**: 四协议支持工具调用与续接、工具选择和严格参数校验；支持联合类型与开放参数定义
 - **TTS 语音生成**: 支持 Gemini TTS 模型的单/多说话人音频生成
 - **图片生成**: 支持 Nano Banana 图片生成
 - **视频生成**: 支持 Veo 视频生成和图片转视频；Gemini Omni 通过四套生成接口接收文本、图片与视频输入，输出文本与 MP4 视频
@@ -45,7 +46,7 @@
 - **Files 与 Transcribe**: 支持文件上传、查询、内容读取、删除和音频转录
 - **Live 与 Robotics**: 通过 WebSocket 支持文本、音频、JPEG、媒体结束、工具调用、恢复和中断
 - **反指纹检测**: 使用 Camoufox 持有官方 WAA 生命周期，并为每个账户固定浏览器指纹与出口
-- **图形界面启动器**: 通过网页管理账户、服务启停、实时日志、模型、请求和配置
+- **图形界面启动器**: 通过网页管理账户、服务启停、实时日志、模型、请求、用量统计和配置
 - **模块化架构**: Go 负责协议、调度、API 与管理端，Camoufox 负责 WAA 运行时和隔离登录
 
 ## 系统要求
@@ -160,11 +161,11 @@ Linux 与 macOS 首次运行同样会自动准备对应平台的 Camoufox。
 ### 日常使用（已有认证）
 
 1. Windows 双击 `start.bat`；Linux 与 macOS 运行 `./aistudio2api`
-2. 点击“启动服务”启用 API
+2. 点击“启动服务”启用 API；设置 `AUTO_START=true` 后，程序启动时自动启动服务
 3. 点击“停止服务”会取消正在进行的启动或活动请求并关闭 WAA Worker，管理页面与日志保持可用
 4. 再次点击“启动服务”即可恢复 API
 
-停止后再次启动会读取最新 `.env` 生成服务配置；管理页面地址和 `PROXY_API_KEY` 在管理进程重启后生效。
+停止后再次启动会读取最新 `.env` 生成服务配置，账户选择策略保存后立即生效；管理页面地址和 `PROXY_API_KEY` 在管理进程重启后生效。
 
 在启动窗口按 `Ctrl+C` 或关闭窗口会退出整个管理进程。关闭浏览器标签页不会停止管理进程。
 
@@ -175,6 +176,8 @@ Linux 与 macOS 首次运行同样会自动准备对应平台的 Camoufox。
 `start.bat -open-ui=false`：启动管理进程但不自动打开网页。
 
 `start.bat setup`：扫描本机 Chrome 账户；也可使用 `--email` 或 `--profile` 选择明确的 Chrome 账户。隔离登录使用 `start.bat setup --login`；文件导入使用 `start.bat setup --storage-state <file>`。
+
+`start.bat setup --remote https://<远程实例>`：向远程实例添加账户。先在远程实例的账户页点击“远程添加”取得配对令牌，再在能登录 Google 的电脑上运行该命令并粘贴令牌；可与 `--login` 等参数组合。
 
 ## API 使用
 
@@ -235,20 +238,30 @@ env_key = "AISTUDIO2API_KEY"
 wire_api = "responses"
 ```
 
-[omp](https://github.com/can1357/oh-my-pi) 的 `web_search` 工具按自身的搜索来源顺序执行。设置 `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:2048` 与 `GEMINI_API_KEY=<PROXY_API_KEY>`，并在 omp 配置中优先使用 Gemini 来源：
+[omp](https://github.com/can1357/oh-my-pi) 的 `web_search` 工具使用 `web` 角色的模型搜索。在 omp 的 `models.yml` 中添加指向本服务的 Gemini provider（`apiKey` 为保存 `PROXY_API_KEY` 的环境变量名），并在 `config.yml` 中把 `web` 角色设为该模型：
 
 ```yaml
+# models.yml
 providers:
-  webSearchOrder:
-    - gemini
-  webSearchGeminiModel: gemini-3.8-flash
+  aistudio-gemini:
+    baseUrl: http://127.0.0.1:2048/v1beta
+    api: google-generative-ai
+    apiKey: AISTUDIO2API_KEY
+    models:
+      - id: gemini-3.8-flash
+```
+
+```yaml
+# config.yml
+modelRoles:
+  web: aistudio-gemini/gemini-3.8-flash
 ```
 
 主要端点：
 
 | 能力 | 端点 |
 | --- | --- |
-| 模型 | `GET /v1/models`、`GET /v1beta/models` |
+| 模型 | `GET /v1/models`、`GET /v1/models/{model}`、`GET /v1beta/models`、`GET /v1beta/models/{model}` |
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
 | Files | `POST /v1/files`、`GET /v1/files/{id}`、`GET /v1/files/{id}/content`、`DELETE /v1/files/{id}` |
@@ -269,6 +282,26 @@ providers:
 Gemini 附件与视频图片输入支持 `inlineData` / `inline_data`、`fileData` / `file_data`、`mimeType` / `mime_type` 和 `fileUri` / `file_uri`。媒体 Base64 数据支持标准与 URL-safe 字母表、带填充与无填充形式，以及 `data:<MIME>;base64,` 前缀。OpenAI 助手历史中的 Markdown 图片同样支持 URL-safe Base64 和 CR/LF 换行。内联 GIF 和视频表单上传的 GIF 按首帧静态图片转换为 PNG，保留逻辑画布、帧位置与透明背景。
 
 ### TTS 语音生成
+
+TalkifyTTS 与新版 Google Gen AI SDK 可连接 `http://127.0.0.1:2048/v1beta/interactions`，稳定版入口为 `/v1/interactions`。请求使用 `x-goog-api-key`，支持 `gemini-3.8-flash-tts` 与 `gemini-3.8-flash-lite-tts`：
+
+```python
+from google import genai
+
+client = genai.Client(api_key="123", http_options={"base_url": "http://127.0.0.1:2048"})
+stream = client.interactions.create(
+    model="gemini-3.8-flash-tts",
+    input="Hello, this is a test.",
+    response_format={"type": "audio"},
+    generation_config={"speech_config": [{"voice": "Kore"}]},
+    stream=True,
+)
+for event in stream:
+    if event.event_type == "step.delta" and event.delta.type == "audio":
+        print(event.delta.data)
+```
+
+流式音频默认为 Base64 编码的 24 kHz、16-bit 小端、单声道 PCM；非流式默认为完整 WAV，通过 `interaction.output_audio.data` 读取。`response_format.mime_type` 可显式选择 `audio/l16` 或 `audio/wav`。风格与多说话人输入见 [Interactions 协议](docs/protocol.md#gemini-interactions)。
 
 ```bash
 curl http://127.0.0.1:2048/v1/audio/speech \
@@ -361,6 +394,7 @@ curl http://127.0.0.1:2048/v1/videos \
 | `gemini-3.7-flash` | Gemini 3.7 Flash | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
 | `gemini-flash-latest` | Gemini Flash Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
 | `gemini-flash-lite-latest` | Gemini Flash-Lite Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
+| `gemini-nano-banana-2.1` | Nano Banana 2.1 | 65536 | 65536 | `batchGenerateContent, countTokens, generateContent` |
 | `gemini-omni-flash-preview` | Gemini Omni Flash Preview | 131072 | 65536 | `countTokens, generateContent` |
 | `gemini-pro-latest` | Gemini Pro Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
 | `gemini-robotics-er-1.6-preview` | Gemini Robotics-ER 1.6 Preview | 131072 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
@@ -407,21 +441,31 @@ cp .env.example .env
 | `AISTUDIO_AUTH_STATES` | `auth` | 账户文件、目录或多个逗号分隔路径 |
 | `LISTEN_ADDR` | `127.0.0.1:2048` | 管理页面与 API 监听地址 |
 | `PROXY_API_KEY` | 空 | 公开 API key |
+| `AUTO_START` | `false` | 管理程序启动后自动启动生成服务 |
+| `REQUEST_BODY_LOG` | `false` | 保存公开 API 请求与响应正文，各截断到 64 KiB，保留最近 1000 条 |
+| `ADMIN_AUTH_ENABLED` | `false` | 管理控制台账号密码登录开关 |
+| `ADMIN_USERNAME` | `admin` | 管理员账号 |
+| `ADMIN_PASSWORD` | 空 | 管理员密码，开启登录时必填 |
 | `PROXY` | 空 | Chrome 导入、登录和账户默认使用的 HTTP、HTTPS 或 SOCKS5 代理 |
 | `INIT_TIMEOUT` | `2m` | 单账户 WAA 初始化超时 |
 | `REQUEST_TIMEOUT` | `5m` | 单次请求最大执行时间 |
 | `WARM_WORKER_LIMIT` | `5` | 常驻预热账户数 |
 | `MAX_ACTIVE_WORKERS` | `10` | 高峰期最多同时运行的 Worker 数 |
-| `WARM_STARTUP_CONCURRENCY` | `2` | 同时初始化的预热账户数 |
+| `WARM_STARTUP_CONCURRENCY` | `5` | 同时冷启动的 Camoufox Worker 数，预热与按需扩容共用；`WAA_BACKEND=go` 时不限制 |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | 单账号同时执行的请求数 |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` 轮询；`fill-first` 账号粘性优先 |
 | `UPSTREAM_CHANNELS` | `playground,build` | 生成请求使用的上游通道，可只保留其一 |
+| `BUILD_NATIVE_NONSTREAM` | `true` | 非流式请求优先使用 Build 原生单次调用；不可用时回退流式并记录原因 |
 | `WAA_BACKEND` | `camoufox` | `camoufox` 在 Camoufox 页面运行 WAA；`go` 在服务进程内运行 WAA，不下载也不启动 Camoufox |
 | `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话 |
 
-服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制常驻预热规模，`MAX_ACTIVE_WORKERS` 控制峰值 Worker 上限，`WARM_STARTUP_CONCURRENCY` 控制启动预热并发，`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位。
+服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制常驻预热规模，`MAX_ACTIVE_WORKERS` 控制峰值 Worker 上限，`WARM_STARTUP_CONCURRENCY` 控制同时冷启动的 Camoufox Worker 数，`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位。
 
 ### 端口配置
+
+管理控制台默认通过本机回环地址免密访问。远程管理时设置 `ADMIN_AUTH_ENABLED=true`、管理员账号和密码，重启程序后通过独立 `/login` 页面登录。登录会话有效期为 12 小时，支持退出登录；管理员共享同一个账户池、配置与日志。公开 API 使用独立的 `PROXY_API_KEY`。
+
+反向代理使用 HTTPS，并保留原始 `Host`、设置 `X-Forwarded-Proto: https`。管理页“服务配置”可调整登录开关及凭据，保存后重启程序生效。
 
 - **管理页面与 API**: 默认端口 `2048`
 - **Camoufox**: 由程序动态分配本机端口
@@ -430,11 +474,12 @@ cp .env.example .env
 
 ### 代理配置
 
-支持通过无认证信息的 HTTP、HTTPS 或 SOCKS5 代理访问 AI Studio：
+支持通过 HTTP、HTTPS 或 SOCKS5 代理访问 AI Studio，代理需要认证时在 URL 中填写账号密码，例如 `socks5://user:password@host:1080`：
 
 1. 在“服务配置”中设置全局代理
 2. 在“账户”页面编辑单个账户时可以设置账户专用代理
 3. 账户代理同时用于登录、WAA 与业务请求
+4. 带账号密码的代理由程序在本机回环地址提供无认证 SOCKS5 中转供 Camoufox 使用，账号密码不写入浏览器 profile；中转运行期间，本机其他进程也能经它使用该代理
 
 ### 认证文件管理
 
@@ -477,7 +522,7 @@ Go 负责编码、调度、流式解码与公开协议；受 WAA 保护的 `Gene
 - **客户端管理历史**: Chat、Anthropic 和 Gemini 请求由客户端提交完整对话上下文
 - **AI Studio 历史**: API 请求不保存到官网历史；`TEMPORARY_CHAT=true` 还会关闭 WAA 预热页的自动保存
 - **Responses 会话**: `previous_response_id` 仅在当前进程内保存，重启后不会保留
-- **认证有效期**: Chrome 导入账户保留 DBSC 续签材料；隔离登录账户失效后在账户页重新登录
+- **认证有效期**: Chrome 导入账户保留 DBSC 续签材料；其他账户失效时，若本机 Chrome 登录着同一邮箱，服务从 Chrome 导入该邮箱的材料续签，此后按 Chrome 导入账户续签，否则在账户页重新登录
 
 ## 故障排除
 

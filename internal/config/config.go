@@ -21,7 +21,7 @@ const (
 	defaultRequestTimeout     = 5 * time.Minute
 	defaultWarmWorkerLimit    = 5
 	defaultMaxActiveWorkers   = 10
-	defaultWarmConcurrency    = 2
+	defaultWarmConcurrency    = 5
 	defaultAccountConcurrency = 2
 )
 
@@ -41,6 +41,12 @@ var configKeys = [...]string{
 	"UPSTREAM_CHANNELS",
 	"TEMPORARY_CHAT",
 	"WAA_BACKEND",
+	"AUTO_START",
+	"REQUEST_BODY_LOG",
+	"ADMIN_AUTH_ENABLED",
+	"ADMIN_USERNAME",
+	"ADMIN_PASSWORD",
+	"BUILD_NATIVE_NONSTREAM",
 }
 
 // upstreamChannels 表示生成请求可启用的上游通道
@@ -54,6 +60,12 @@ const WAABackendGo = "go"
 
 // Config 保存服务的全局配置
 type Config struct {
+	AutoStart              bool          `json:"auto_start"`
+	RequestBodyLog         bool          `json:"request_body_log"`
+	AdminAuthEnabled       bool          `json:"admin_auth_enabled"`
+	AdminUsername          string        `json:"admin_username"`
+	AdminPassword          string        `json:"-"`
+	BuildNativeNonstream   bool          `json:"build_native_nonstream"`
 	AuthStates             string        `json:"auth_states"`
 	ListenAddr             string        `json:"listen_addr"`
 	ProxyAPIKey            string        `json:"proxy_api_key"`
@@ -74,6 +86,8 @@ type Config struct {
 // Default 返回可直接启动的默认配置
 func Default() Config {
 	return Config{
+		AdminUsername:          "admin",
+		BuildNativeNonstream:   true,
 		AuthStates:             defaultAuthStates,
 		ListenAddr:             defaultListenAddr,
 		InitTimeout:            defaultInitTimeout,
@@ -101,6 +115,36 @@ func Load(path string) (Config, error) {
 	}
 
 	cfg := Default()
+	if value, ok := values["AUTO_START"]; ok {
+		cfg.AutoStart, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("AUTO_START 必须是 true 或 false")
+		}
+	}
+	if value, ok := values["REQUEST_BODY_LOG"]; ok {
+		cfg.RequestBodyLog, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("REQUEST_BODY_LOG 必须是 true 或 false")
+		}
+	}
+	if value, ok := values["ADMIN_AUTH_ENABLED"]; ok {
+		cfg.AdminAuthEnabled, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("ADMIN_AUTH_ENABLED 必须是 true 或 false")
+		}
+	}
+	if value, ok := values["ADMIN_USERNAME"]; ok {
+		cfg.AdminUsername = strings.TrimSpace(value)
+	}
+	if value, ok := values["ADMIN_PASSWORD"]; ok {
+		cfg.AdminPassword = value
+	}
+	if value, ok := values["BUILD_NATIVE_NONSTREAM"]; ok {
+		cfg.BuildNativeNonstream, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("BUILD_NATIVE_NONSTREAM 必须是 true 或 false")
+		}
+	}
 	if value, ok := values["AISTUDIO_AUTH_STATES"]; ok {
 		cfg.AuthStates = strings.TrimSpace(value)
 	}
@@ -182,6 +226,12 @@ func (c Config) Save(path string) error {
 		return err
 	}
 	values := map[string]string{
+		"AUTO_START":               strconv.FormatBool(c.AutoStart),
+		"REQUEST_BODY_LOG":         strconv.FormatBool(c.RequestBodyLog),
+		"ADMIN_AUTH_ENABLED":       strconv.FormatBool(c.AdminAuthEnabled),
+		"ADMIN_USERNAME":           c.AdminUsername,
+		"ADMIN_PASSWORD":           c.AdminPassword,
+		"BUILD_NATIVE_NONSTREAM":   strconv.FormatBool(c.BuildNativeNonstream),
 		"AISTUDIO_AUTH_STATES":     c.AuthStates,
 		"LISTEN_ADDR":              c.ListenAddr,
 		"PROXY_API_KEY":            c.ProxyAPIKey,
@@ -211,6 +261,9 @@ func (c Config) Save(path string) error {
 
 // Validate 校验配置值是否能用于服务启动
 func (c Config) Validate() error {
+	if c.AdminAuthEnabled && (strings.TrimSpace(c.AdminUsername) == "" || strings.TrimSpace(c.AdminPassword) == "") {
+		return fmt.Errorf("开启管理登录需要 ADMIN_USERNAME 与 ADMIN_PASSWORD")
+	}
 	if strings.TrimSpace(c.AuthStates) == "" {
 		return fmt.Errorf("AISTUDIO_AUTH_STATES 不能为空")
 	}
@@ -232,8 +285,8 @@ func (c Config) Validate() error {
 	if c.MaxActiveWorkers < c.WarmWorkerLimit {
 		return fmt.Errorf("MAX_ACTIVE_WORKERS 必须大于或等于 WARM_WORKER_LIMIT")
 	}
-	if c.WarmStartupConcurrency <= 0 || c.WarmStartupConcurrency > c.WarmWorkerLimit {
-		return fmt.Errorf("WARM_STARTUP_CONCURRENCY 必须是 1 到 WARM_WORKER_LIMIT")
+	if c.WarmStartupConcurrency <= 0 || c.WarmStartupConcurrency > c.MaxActiveWorkers {
+		return fmt.Errorf("WARM_STARTUP_CONCURRENCY 必须是 1 到 MAX_ACTIVE_WORKERS")
 	}
 	if c.PerAccountConcurrency <= 0 {
 		return fmt.Errorf("PER_ACCOUNT_CONCURRENCY 必须是正整数")
@@ -286,23 +339,33 @@ func validateUpstreamChannels(channels []string) error {
 // MarshalJSON 将时长输出为 env 使用的文本格式
 func (c Config) MarshalJSON() ([]byte, error) {
 	type payload struct {
-		AuthStates             string `json:"auth_states"`
-		ListenAddr             string `json:"listen_addr"`
-		ProxyAPIKey            string `json:"proxy_api_key"`
-		AllowRemoteControl     bool   `json:"allow_remote_control"`
-		Proxy                  string `json:"proxy"`
-		InitTimeout            string `json:"init_timeout"`
-		RequestTimeout         string `json:"request_timeout"`
-		WarmWorkerLimit        int    `json:"warm_worker_limit"`
-		MaxActiveWorkers       int    `json:"max_active_workers"`
-		WarmStartupConcurrency int    `json:"warm_startup_concurrency"`
-		PerAccountConcurrency  int    `json:"per_account_concurrency"`
-		RoutingStrategy        string `json:"routing_strategy"`
+		AutoStart              bool     `json:"auto_start"`
+		RequestBodyLog         bool     `json:"request_body_log"`
+		AdminAuthEnabled       bool     `json:"admin_auth_enabled"`
+		AdminUsername          string   `json:"admin_username"`
+		BuildNativeNonstream   bool     `json:"build_native_nonstream"`
+		AuthStates             string   `json:"auth_states"`
+		ListenAddr             string   `json:"listen_addr"`
+		ProxyAPIKey            string   `json:"proxy_api_key"`
+		AllowRemoteControl     bool     `json:"allow_remote_control"`
+		Proxy                  string   `json:"proxy"`
+		InitTimeout            string   `json:"init_timeout"`
+		RequestTimeout         string   `json:"request_timeout"`
+		WarmWorkerLimit        int      `json:"warm_worker_limit"`
+		MaxActiveWorkers       int      `json:"max_active_workers"`
+		WarmStartupConcurrency int      `json:"warm_startup_concurrency"`
+		PerAccountConcurrency  int      `json:"per_account_concurrency"`
+		RoutingStrategy        string   `json:"routing_strategy"`
 		UpstreamChannels       []string `json:"upstream_channels"`
 		TemporaryChat          bool     `json:"temporary_chat"`
 		WAABackend             string   `json:"waa_backend"`
 	}
 	return json.Marshal(payload{
+		AutoStart:              c.AutoStart,
+		RequestBodyLog:         c.RequestBodyLog,
+		AdminAuthEnabled:       c.AdminAuthEnabled,
+		AdminUsername:          c.AdminUsername,
+		BuildNativeNonstream:   c.BuildNativeNonstream,
 		AuthStates:             c.AuthStates,
 		ListenAddr:             c.ListenAddr,
 		ProxyAPIKey:            c.ProxyAPIKey,
@@ -324,18 +387,24 @@ func (c Config) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON 从管理接口使用的文本时长解析配置
 func (c *Config) UnmarshalJSON(data []byte) error {
 	type payload struct {
-		AuthStates             string `json:"auth_states"`
-		ListenAddr             string `json:"listen_addr"`
-		ProxyAPIKey            string `json:"proxy_api_key"`
-		AllowRemoteControl     bool   `json:"allow_remote_control"`
-		Proxy                  string `json:"proxy"`
-		InitTimeout            string `json:"init_timeout"`
-		RequestTimeout         string `json:"request_timeout"`
-		WarmWorkerLimit        int    `json:"warm_worker_limit"`
-		MaxActiveWorkers       int    `json:"max_active_workers"`
-		WarmStartupConcurrency int    `json:"warm_startup_concurrency"`
-		PerAccountConcurrency  int    `json:"per_account_concurrency"`
-		RoutingStrategy        string `json:"routing_strategy"`
+		AutoStart              bool     `json:"auto_start"`
+		RequestBodyLog         bool     `json:"request_body_log"`
+		AdminAuthEnabled       bool     `json:"admin_auth_enabled"`
+		AdminUsername          string   `json:"admin_username"`
+		AdminPassword          string   `json:"admin_password"`
+		BuildNativeNonstream   bool     `json:"build_native_nonstream"`
+		AuthStates             string   `json:"auth_states"`
+		ListenAddr             string   `json:"listen_addr"`
+		ProxyAPIKey            string   `json:"proxy_api_key"`
+		AllowRemoteControl     bool     `json:"allow_remote_control"`
+		Proxy                  string   `json:"proxy"`
+		InitTimeout            string   `json:"init_timeout"`
+		RequestTimeout         string   `json:"request_timeout"`
+		WarmWorkerLimit        int      `json:"warm_worker_limit"`
+		MaxActiveWorkers       int      `json:"max_active_workers"`
+		WarmStartupConcurrency int      `json:"warm_startup_concurrency"`
+		PerAccountConcurrency  int      `json:"per_account_concurrency"`
+		RoutingStrategy        string   `json:"routing_strategy"`
 		UpstreamChannels       []string `json:"upstream_channels"`
 		TemporaryChat          bool     `json:"temporary_chat"`
 		WAABackend             string   `json:"waa_backend"`
@@ -353,6 +422,12 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	parsed := Config{
+		AutoStart:              value.AutoStart,
+		RequestBodyLog:         value.RequestBodyLog,
+		AdminAuthEnabled:       value.AdminAuthEnabled,
+		AdminUsername:          strings.TrimSpace(value.AdminUsername),
+		AdminPassword:          value.AdminPassword,
+		BuildNativeNonstream:   value.BuildNativeNonstream,
 		AuthStates:             strings.TrimSpace(value.AuthStates),
 		ListenAddr:             strings.TrimSpace(value.ListenAddr),
 		ProxyAPIKey:            strings.TrimSpace(value.ProxyAPIKey),
@@ -391,8 +466,8 @@ func ValidateProxy(value string) error {
 	default:
 		return fmt.Errorf("PROXY 必须是 http、https 或 socks5 URL")
 	}
-	if parsed.User != nil {
-		return fmt.Errorf("PROXY 不能包含认证信息")
+	if parsed.User != nil && parsed.User.Username() == "" {
+		return fmt.Errorf("PROXY 认证信息缺少用户名")
 	}
 	if parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("PROXY 不能包含路径、查询参数或片段")

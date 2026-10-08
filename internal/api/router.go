@@ -13,6 +13,10 @@ import (
 type Config struct {
 	APIKey             string
 	Admin              AdminService
+	AdminAuthEnabled   bool
+	AdminUsername      string
+	AdminPassword      string
+	Ledger             RequestLedger
 	AllowRemoteControl bool
 }
 
@@ -21,17 +25,24 @@ type server struct {
 	config            Config
 	responseStates    *responseStateStore
 	thoughtSignatures *thoughtSignatureStore
+	pairing           *pairingTokens
 }
 
 var idSequence atomic.Uint64
 
 // NewHandler 创建公开 API 路由
 func NewHandler(service aistudio.Service, config Config) http.Handler {
-	s := &server{service: service, config: config, responseStates: newResponseStateStore(), thoughtSignatures: newThoughtSignatureStore()}
+	s := &server{
+		service: service, config: config, responseStates: newResponseStateStore(),
+		thoughtSignatures: newThoughtSignatureStore(), pairing: &pairingTokens{},
+	}
 	public := http.NewServeMux()
 	public.HandleFunc("GET /v1/models", s.handleOpenAIModels)
+	public.HandleFunc("GET /v1/models/{model...}", s.handleOpenAIModel)
 	public.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	public.HandleFunc("POST /v1/responses", s.handleResponses)
+	public.HandleFunc("POST /v1/interactions", s.handleInteraction)
+	public.HandleFunc("POST /v1beta/interactions", s.handleInteraction)
 	public.HandleFunc("POST /v1/files", s.handleOpenAIFileUpload)
 	public.HandleFunc("GET /v1/files/{file}", s.handleOpenAIFileGet)
 	public.HandleFunc("GET /v1/files/{file}/content", s.handleOpenAIFileContent)
@@ -47,7 +58,7 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	public.HandleFunc("POST /v1/messages", s.handleAnthropicMessages)
 	public.HandleFunc("POST /v1/messages/count_tokens", s.handleAnthropicCountTokens)
 	public.HandleFunc("GET /v1beta/models", s.handleGeminiModels)
-	public.HandleFunc("GET /v1beta/models/{model}", s.handleGeminiModel)
+	public.HandleFunc("GET /v1beta/models/{model...}", s.handleGeminiModel)
 	public.HandleFunc("POST /v1beta/models/{action}", s.handleGeminiAction)
 	public.HandleFunc("GET /v1beta/operations/{operation}", s.handleGeminiVideoOperation)
 
@@ -57,17 +68,20 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	if config.Admin != nil {
 		s.registerAdmin(control)
 	}
+	if config.Ledger != nil {
+		s.registerLedger(control)
+	}
 
 	root := http.NewServeMux()
 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
-	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, public)))
-	root.Handle("/v1/", requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler)))
-	root.Handle("/v1beta/", requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler)))
-	controlHandler := sameOriginMiddleware(control)
-	if !config.AllowRemoteControl {
-		controlHandler = loopbackMiddleware(controlHandler)
+	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, requestBodyMiddleware(config.Ledger, public))))
+	loggedHandler := requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler))
+	root.Handle("/v1/", loggedHandler)
+	root.Handle("/v1beta/", loggedHandler)
+	root.Handle("/api/", newAdminAuth(config).handler(control))
+	if config.Admin != nil {
+		root.HandleFunc("POST /api/pairing/accounts", s.handlePairingAccount)
 	}
-	root.Handle("/api/", controlHandler)
 	return root
 }
 

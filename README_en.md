@@ -36,6 +36,7 @@
 ## Features
 
 - **Native Streaming**: Text, reasoning summaries, function calls, Google tools, media, and usage
+- **Function Tools**: Tool calls, continuation, selection, and strict argument validation across all four protocols, including union types and open parameter schemas
 - **TTS Speech Generation**: Gemini TTS models for single-speaker and multi-speaker audio
 - **Image Generation**: Nano Banana image generation
 - **Video Generation**: Veo video generation and image-to-video; Gemini Omni accepts text, image, and video input and returns text and MP4 video through the four generation APIs
@@ -45,7 +46,7 @@
 - **Files and Transcribe**: File upload, metadata, content, deletion, and audio transcription
 - **Live and Robotics**: WebSocket text, audio, JPEG images, media end, tool calls, resumption, and interruption
 - **Anti-Fingerprinting**: Camoufox holds the official WAA lifecycle with a stable browser fingerprint and network exit per account
-- **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, and configuration in the web UI
+- **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, usage statistics, and configuration in the web UI
 - **Modular Architecture**: Go handles protocols, scheduling, APIs, and management; Camoufox hosts WAA and isolated login
 
 ## System Requirements
@@ -160,11 +161,11 @@ Account actions depend on state:
 ### Daily Use (With Existing Authentication)
 
 1. Double-click `start.bat` on Windows; run `./aistudio2api` on Linux or macOS
-2. Click "Start service" to enable the APIs
+2. Click "Start service" to enable the APIs; with `AUTO_START=true`, the service starts together with the manager
 3. "Stop service" cancels an in-progress launch or active requests and closes WAA workers while the management UI and Logs remain available
 4. Click "Start service" again to resume the APIs
 
-Starting again loads the latest data-plane settings from `.env`. Changes to `LISTEN_ADDR` or `PROXY_API_KEY` require restarting the management process.
+Starting again loads the latest data-plane settings from `.env`; the account selection strategy applies as soon as it is saved. Changes to `LISTEN_ADDR` or `PROXY_API_KEY` require restarting the management process.
 
 Press `Ctrl+C` in the launch window or close that window to exit the manager. Closing the browser tab does not stop the manager.
 
@@ -175,6 +176,8 @@ Press `Ctrl+C` in the launch window or close that window to exit the manager. Cl
 `start.bat -open-ui=false`: Starts the manager without opening the web UI.
 
 `start.bat setup`: Scans local Chrome accounts. Use `--email` or `--profile` to select a Chrome account. Run `start.bat setup --login` for an isolated login, or `start.bat setup --storage-state <file>` to import a file.
+
+`start.bat setup --remote https://<remote-instance>`: Adds accounts to a remote instance. Click "Add remotely" on the remote instance's Accounts page to get a pairing token, then run the command on a computer that can sign in to Google and paste the token. It combines with options such as `--login`.
 
 ## API Usage
 
@@ -235,20 +238,30 @@ env_key = "AISTUDIO2API_KEY"
 wire_api = "responses"
 ```
 
-[omp](https://github.com/can1357/oh-my-pi) runs its `web_search` tool through its own provider order. Set `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:2048` and `GEMINI_API_KEY=<PROXY_API_KEY>`, and put the Gemini provider first in the omp config:
+[omp](https://github.com/can1357/oh-my-pi) runs its `web_search` tool with the model of the `web` role. Add a Gemini provider that points to this service in omp's `models.yml` (`apiKey` is the name of the environment variable holding `PROXY_API_KEY`), then set the `web` role to that model in `config.yml`:
 
 ```yaml
+# models.yml
 providers:
-  webSearchOrder:
-    - gemini
-  webSearchGeminiModel: gemini-3.8-flash
+  aistudio-gemini:
+    baseUrl: http://127.0.0.1:2048/v1beta
+    api: google-generative-ai
+    apiKey: AISTUDIO2API_KEY
+    models:
+      - id: gemini-3.8-flash
+```
+
+```yaml
+# config.yml
+modelRoles:
+  web: aistudio-gemini/gemini-3.8-flash
 ```
 
 Main endpoints:
 
 | Capability | Endpoint |
 | --- | --- |
-| Models | `GET /v1/models`, `GET /v1beta/models` |
+| Models | `GET /v1/models`, `GET /v1/models/{model}`, `GET /v1beta/models`, `GET /v1beta/models/{model}` |
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
 | Files | `POST /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` |
@@ -269,6 +282,26 @@ Inline attachments in generation requests are preferentially uploaded as tempora
 Gemini attachments and video image inputs accept `inlineData` / `inline_data`, `fileData` / `file_data`, `mimeType` / `mime_type`, and `fileUri` / `file_uri`. Base64 media data supports standard and URL-safe alphabets, padded and unpadded forms, and the `data:<MIME>;base64,` prefix. Markdown images in OpenAI assistant history also support URL-safe Base64 and CR/LF line breaks. Inline GIFs and GIFs uploaded through video multipart requests are converted to PNG using the first frame, preserving the logical canvas, frame position, and transparency.
 
 ### TTS Speech Generation
+
+TalkifyTTS and the Google Gen AI SDK can connect to `http://127.0.0.1:2048/v1beta/interactions`; the stable endpoint is `/v1/interactions`. Authenticate with `x-goog-api-key`. Both `gemini-3.8-flash-tts` and `gemini-3.8-flash-lite-tts` support single-speaker and multi-speaker synthesis.
+
+```python
+from google import genai
+
+client = genai.Client(api_key="123", http_options={"base_url": "http://127.0.0.1:2048"})
+stream = client.interactions.create(
+    model="gemini-3.8-flash-tts",
+    input="Hello, this is a test.",
+    response_format={"type": "audio"},
+    generation_config={"speech_config": [{"voice": "Kore"}]},
+    stream=True,
+)
+for event in stream:
+    if event.event_type == "step.delta" and event.delta.type == "audio":
+        print(event.delta.data)
+```
+
+Streaming defaults to Base64-encoded 24 kHz, 16-bit little-endian mono PCM. Non-streaming defaults to a complete WAV file, available through `interaction.output_audio.data`. Set `response_format.mime_type` to `audio/l16` or `audio/wav` to select the format. See the [Interactions protocol](docs/protocol.md#gemini-interactions) for style annotations and multi-speaker input.
 
 ```bash
 curl http://127.0.0.1:2048/v1/audio/speech \
@@ -361,6 +394,7 @@ The model catalog follows AI Studio updates; clients read the current values fro
 | `gemini-3.7-flash` | Gemini 3.7 Flash | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
 | `gemini-flash-latest` | Gemini Flash Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
 | `gemini-flash-lite-latest` | Gemini Flash-Lite Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
+| `gemini-nano-banana-2.1` | Nano Banana 2.1 | 65536 | 65536 | `batchGenerateContent, countTokens, generateContent` |
 | `gemini-omni-flash-preview` | Gemini Omni Flash Preview | 131072 | 65536 | `countTokens, generateContent` |
 | `gemini-pro-latest` | Gemini Pro Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
 | `gemini-robotics-er-1.6-preview` | Gemini Robotics-ER 1.6 Preview | 131072 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
@@ -408,21 +442,31 @@ cp .env.example .env
 | `LISTEN_ADDR` | `127.0.0.1:2048` | Management UI and API listen address |
 | `PROXY_API_KEY` | empty | Public API key |
 | `ALLOW_REMOTE_CONTROL` | `false` | Allow management/control-plane requests from non-loopback clients; protect this with a strong API key and network firewall |
+| `AUTO_START` | `false` | Start the generation service when the manager starts |
+| `REQUEST_BODY_LOG` | `false` | Store public API request and response bodies, each truncated to 64 KiB, keeping the latest 1000 |
+| `ADMIN_AUTH_ENABLED` | `false` | Enable username/password login for the console |
+| `ADMIN_USERNAME` | `admin` | Administrator username |
+| `ADMIN_PASSWORD` | empty | Administrator password, required when login is enabled |
 | `PROXY` | empty | HTTP, HTTPS, or SOCKS5 proxy used by Chrome import, login, and accounts without an override |
 | `INIT_TIMEOUT` | `2m` | Per-account WAA initialization timeout |
 | `REQUEST_TIMEOUT` | `5m` | Maximum request execution time |
 | `WARM_WORKER_LIMIT` | `5` | Number of resident prewarmed accounts |
 | `MAX_ACTIVE_WORKERS` | `10` | Maximum workers active during peak load |
-| `WARM_STARTUP_CONCURRENCY` | `2` | Accounts initialized concurrently during prewarming |
+| `WARM_STARTUP_CONCURRENCY` | `5` | Camoufox workers cold-started concurrently, shared by prewarming and on-demand scaling; unlimited with `WAA_BACKEND=go` |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | Concurrent requests allowed per account |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` rotates accounts; `fill-first` reuses the first available account |
 | `UPSTREAM_CHANNELS` | `playground,build` | Upstream channels for generation requests; either one can be used alone |
+| `BUILD_NATIVE_NONSTREAM` | `true` | Prefer native Build unary calls for non-streaming requests; log any fallback to stream collection |
 | `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `go` runs WAA inside the service process and neither downloads nor starts Camoufox |
 | `TEMPORARY_CHAT` | `false` | Use Temporary Chat for the WAA prewarm page |
 
-The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` controls concurrent prewarming, and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
+The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` controls how many Camoufox workers cold-start at once, and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
 
 ### Port Configuration
+
+The console allows passwordless loopback access by default. For remote management, set `ADMIN_AUTH_ENABLED=true`, configure the administrator username and password, and restart the process. The separate `/login` page creates a 12-hour session with sign-out support. Administrators share the instance's account pool, configuration, and logs. Public APIs use the separate `PROXY_API_KEY`.
+
+Use an HTTPS reverse proxy that preserves `Host` and sets `X-Forwarded-Proto: https`. Console login settings can also be saved from the settings page and take effect after restarting the process.
 
 - **Management UI and APIs**: Default port `2048`
 - **Camoufox**: Local ports are allocated dynamically
@@ -431,11 +475,12 @@ The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT`
 
 ### Proxy Configuration
 
-HTTP, HTTPS, and SOCKS5 proxies without embedded credentials are supported:
+HTTP, HTTPS, and SOCKS5 proxies are supported. For proxies that require authentication, include the credentials in the URL, for example `socks5://user:password@host:1080`:
 
 1. Set the global proxy under Service Configuration
 2. Edit an account to set an account-specific proxy
 3. The account proxy is used for login, WAA, and business requests
+4. For authenticated proxies, the program gives Camoufox a credential-free SOCKS5 relay on the loopback address; the credentials are not written to the browser profile. While the relay runs, other local processes can also use the proxy through it
 
 ### Authentication File Management
 
@@ -478,7 +523,7 @@ With `WAA_BACKEND=go`, WAA runs inside the service process, emulates the Firefox
 - **Client-Managed History**: Clients submit complete conversation context for Chat, Anthropic, and Gemini requests
 - **AI Studio History**: API requests are not saved to website history; `TEMPORARY_CHAT=true` also disables autosave for the WAA prewarm page
 - **Responses Sessions**: `previous_response_id` is stored only in the current process and is cleared on restart
-- **Authentication Expiry**: Chrome imports retain DBSC renewal material; isolated-login accounts must log in again after authentication expires
+- **Authentication Expiry**: Chrome imports retain DBSC renewal material. When another account expires and the local Chrome is signed in to the same email, the service renews it with that email's material from Chrome and renews it as a Chrome import from then on; otherwise log in again on the Accounts page
 
 ## Troubleshooting
 

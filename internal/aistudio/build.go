@@ -26,11 +26,6 @@ const buildProofField = 3
 // buildThinkingLevels 把 thinking level 枚举换算为 Gemini API 名称
 var buildThinkingLevels = map[int64]string{1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "MINIMAL"}
 
-// buildSafetyCategories 为官网 Playground 关闭过滤的四个安全类别
-var buildSafetyCategories = []string{
-	"HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
-}
-
 // buildModelDefaults 返回 Build 独有模型按目录推导的生成默认值
 func buildModelDefaults(model Model) GenerationDefaults {
 	thinking := model.Capabilities["thinking"]
@@ -61,8 +56,27 @@ func EncodeBuildGenerateRequest(request GenerateRequest, defaults GenerationDefa
 	if len(tools) > 0 {
 		body["tools"] = tools
 	}
+	toolConfig := map[string]any{}
 	if serverSide {
-		body["toolConfig"] = map[string]any{"includeServerSideToolInvocations": true}
+		toolConfig["includeServerSideToolInvocations"] = true
+	}
+	mode := request.Tools.ToolConfig.Mode
+	if len(request.Tools.Functions) > 0 && mode != "none" {
+		calling := map[string]any{"mode": "AUTO"}
+		if mode == "required" {
+			calling["mode"] = "ANY"
+		} else if mode == "validated" || slices.ContainsFunc(request.Tools.Functions, func(value FunctionDeclaration) bool { return value.Strict }) {
+			calling["mode"] = "VALIDATED"
+		}
+		if mode == "required" && len(request.Tools.ToolConfig.AllowedFunctionNames) > 0 {
+			calling["allowedFunctionNames"] = request.Tools.ToolConfig.AllowedFunctionNames
+		}
+		if mode != "" && mode != "auto" || calling["mode"] != "AUTO" || len(request.Tools.ToolConfig.AllowedFunctionNames) > 0 {
+			toolConfig["functionCallingConfig"] = calling
+		}
+	}
+	if len(toolConfig) > 0 {
+		body["toolConfig"] = toolConfig
 	}
 	config, err := encodeBuildGenerationConfig(request.Config, defaults)
 	if err != nil {
@@ -71,10 +85,14 @@ func EncodeBuildGenerateRequest(request GenerateRequest, defaults GenerationDefa
 	if len(config) > 0 {
 		body["generationConfig"] = config
 	}
-	if !imageRoute {
-		settings := make([]any, 0, len(buildSafetyCategories))
-		for _, category := range buildSafetyCategories {
-			settings = append(settings, map[string]any{"category": category, "threshold": "OFF"})
+	safety, err := resolveSafetySettings(request.SafetySettings, imageRoute)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(safety) > 0 {
+		settings := make([]any, 0, len(safety))
+		for _, setting := range safety {
+			settings = append(settings, map[string]any{"category": setting.Category, "threshold": setting.Threshold})
 		}
 		body["safetySettings"] = settings
 	}
@@ -266,9 +284,9 @@ func encodeBuildTools(tools Tools) ([]any, bool, error) {
 	switch tools.ToolConfig.Mode {
 	case "none":
 		return nil, false, nil
-	case "", "auto":
+	case "", "auto", "required", "validated":
 	default:
-		return nil, false, fmt.Errorf("tool choice 只支持 auto 或 none")
+		return nil, false, fmt.Errorf("未知 tool choice %q", tools.ToolConfig.Mode)
 	}
 	var wire []any
 	if len(tools.Functions) > 0 {
@@ -282,7 +300,11 @@ func encodeBuildTools(tools Tools) ([]any, bool, error) {
 				encoded["description"] = declaration.Description
 			}
 			if len(bytes.TrimSpace(declaration.Parameters)) > 0 {
-				encoded["parametersJsonSchema"] = json.RawMessage(declaration.Parameters)
+				parameters, err := normalizeFunctionParameters(declaration.Parameters)
+				if err != nil {
+					return nil, false, fmt.Errorf("function declaration %d parameters: %w", index, err)
+				}
+				encoded["parametersJsonSchema"] = parameters
 			}
 			declarations = append(declarations, encoded)
 		}
@@ -338,9 +360,7 @@ func encodeBuildTools(tools Tools) ([]any, bool, error) {
 
 // encodeBuildGenerationConfig 复用 Playground 的参数校验与默认值，并转换为 Gemini API 字段
 func encodeBuildGenerationConfig(config GenerationConfig, defaults GenerationDefaults) (map[string]any, error) {
-	validationConfig := config
-	validationConfig.ResponseSchema = nil
-	wire, err := encodeGenerationConfig(validationConfig, defaults)
+	wire, err := encodeGenerationConfig(config, defaults)
 	if err != nil {
 		return nil, err
 	}
@@ -360,8 +380,11 @@ func encodeBuildGenerationConfig(config GenerationConfig, defaults GenerationDef
 	if config.ResponseMIMEType != "" {
 		encoded["responseMimeType"] = config.ResponseMIMEType
 	}
-	if len(bytes.TrimSpace(config.ResponseSchema)) > 0 {
-		encoded["responseJsonSchema"] = json.RawMessage(config.ResponseSchema)
+	if len(wire) > 17 && wire[17] != nil {
+		encoded["mediaResolution"] = strings.ToUpper(strings.TrimSpace(config.MediaResolution))
+	}
+	if wire[8] != nil {
+		encoded["responseSchema"] = buildResponseSchema(wire[8].([]any))
 	}
 	if config.ResponseModalities != nil {
 		modalities := make([]string, 0, len(config.ResponseModalities))
@@ -403,7 +426,7 @@ func encodeBuildGenerationConfig(config GenerationConfig, defaults GenerationDef
 	}
 	if len(wire) > 16 && wire[16] != nil {
 		thinking := wire[16].([]any)
-		thinkingConfig := map[string]any{"includeThoughts": true}
+		thinkingConfig := map[string]any{"includeThoughts": !config.HideThinking}
 		if len(thinking) > 1 && thinking[1] != nil {
 			thinkingConfig["thinkingBudget"] = thinking[1]
 		}
@@ -769,19 +792,31 @@ func buildTrailerError(raw json.RawMessage) error {
 	if code == 0 {
 		return nil
 	}
-	rpcError := &RPCError{Method: buildProxyStreamedMethod, StatusCode: http.StatusBadGateway, Code: code}
+	statusCode := http.StatusBadGateway
 	if mapped, ok := interactionStatusHTTP[code]; ok {
-		rpcError.StatusCode = mapped
+		statusCode = mapped
 	}
-	if len(status) > 1 {
-		rpcError.Message, _ = rawString(status[1], "$[1][1]", raw)
-	}
-	return rpcError
+	return DecodeRPCError(buildProxyStreamedMethod, statusCode, raw)
 }
 
 // sendBuild 编码并发送 Build 代理请求，返回响应与含 finishReason 校验的解码
 func (c *Client) sendBuild(ctx context.Context, request GenerateRequest, entry modelEntry) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
-	unary := buildUsesUnary(entry.model)
+	unary := request.Unary || buildUsesUnary(entry.model)
+	response, decoder, err := c.sendBuildMode(ctx, request, entry, unary, "")
+	var rpcErr *RPCError
+	if err != nil && request.Unary && !buildUsesUnary(entry.model) && ctx.Err() == nil && errors.As(err, &rpcErr) {
+		message := strings.ToLower(rpcErr.Message)
+		unsupported := rpcErr.StatusCode == http.StatusMethodNotAllowed || rpcErr.StatusCode == http.StatusNotImplemented ||
+			rpcErr.Code == 12 || rpcErr.StatusCode == http.StatusBadRequest && strings.Contains(message, "support") && (strings.Contains(message, "stream") || strings.Contains(message, "unary"))
+		if unsupported {
+			return c.sendBuildMode(ctx, request, entry, false, "Build 原生单次调用不可用: "+rpcErr.Error())
+		}
+	}
+	return response, decoder, err
+}
+
+// sendBuildMode 按选定模式发送 Build 请求
+func (c *Client) sendBuildMode(ctx context.Context, request GenerateRequest, entry modelEntry, unary bool, reason string) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
 	path, body, err := EncodeBuildGenerateRequest(request, entry.defaults, request.ImageRoute, unary)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
@@ -794,6 +829,11 @@ func (c *Client) sendBuild(ctx context.Context, request GenerateRequest, entry m
 	if unary {
 		method = buildProxyUnaryMethod
 	}
+	mode := "stream"
+	if unary {
+		mode = "native"
+	}
+	reportUpstreamMode(ctx, method, mode, reason)
 	rpc := newRPCRequest(method, request.AccountID, request.ID, proxy, !unary)
 	c.applyBenefitTier(rpc.Method, request.AccountID, rpc.Header)
 	response, err := c.protected.DoProtected(ctx, request, rpc)

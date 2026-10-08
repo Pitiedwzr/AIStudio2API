@@ -17,6 +17,12 @@ type geminiRequest struct {
 	GenerationConfig  geminiGenerationConfig `json:"generationConfig"`
 	Tools             []geminiToolGroup      `json:"tools"`
 	ToolConfig        geminiToolConfig       `json:"toolConfig"`
+	SafetySettings    []geminiSafetySetting  `json:"safetySettings"`
+}
+
+type geminiSafetySetting struct {
+	Category  string `json:"category"`
+	Threshold string `json:"threshold"`
 }
 
 type geminiContent struct {
@@ -143,6 +149,7 @@ type geminiGenerationConfig struct {
 	SpeechConfig        *geminiSpeechConfig        `json:"speechConfig"`
 	TranscriptionConfig *geminiTranscriptionConfig `json:"transcriptionConfig"`
 	Seed                *int64                     `json:"seed"`
+	MediaResolution     string                     `json:"mediaResolution"`
 	ThinkingConfig      *struct {
 		ThinkingBudget *int64 `json:"thinkingBudget"`
 		ThinkingLevel  string `json:"thinkingLevel"`
@@ -219,7 +226,7 @@ func (s *server) handleGeminiModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
-	modelID := strings.TrimPrefix(r.PathValue("model"), "models/")
+	modelID := r.PathValue("model")
 	models, err := s.service.Models(r.Context())
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
@@ -227,11 +234,9 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	for _, model := range models {
-		if model.ID == modelID {
-			writeJSON(w, http.StatusOK, geminiModelObject(model))
-			return
-		}
+	if model, ok := lookupPublicModel(models, modelID); ok {
+		writeJSON(w, http.StatusOK, geminiModelObject(model))
+		return
 	}
 	writeGeminiError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("model %q is unavailable", modelID))
 }
@@ -279,10 +284,6 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 	var request geminiRequest
 	if err := decodeJSON(r, &request); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
-		return
-	}
-	if len(request.Contents) == 0 {
-		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "contents is required")
 		return
 	}
 	generateRequest, err := request.toGenerateRequest(newID("resp"), model)
@@ -352,6 +353,7 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 		ResponseMIMEType: request.GenerationConfig.ResponseMIMEType,
 		ResponseSchema:   request.GenerationConfig.ResponseSchema,
 		Seed:             request.GenerationConfig.Seed,
+		MediaResolution:  request.GenerationConfig.MediaResolution,
 	}
 	config.ResponseModalities, err = mapGeminiResponseModalities(request.GenerationConfig.ResponseModalities)
 	if err != nil {
@@ -375,8 +377,13 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 		config.ThinkingBudget = request.GenerationConfig.ThinkingConfig.ThinkingBudget
 		config.ReasoningEffort = request.GenerationConfig.ThinkingConfig.ThinkingLevel
 	}
+	safety := make([]aistudio.SafetySetting, 0, len(request.SafetySettings))
+	for _, setting := range request.SafetySettings {
+		safety = append(safety, aistudio.SafetySetting{Category: setting.Category, Threshold: setting.Threshold})
+	}
 	return aistudio.GenerateRequest{
 		ID: id, Model: model, System: system, Contents: contents, Config: config, Tools: tools,
+		SafetySettings: safety,
 	}, nil
 }
 
@@ -732,21 +739,18 @@ func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio
 		}
 	}
 	var toolConfig aistudio.ToolConfig
-	if len(config.FunctionCallingConfig.AllowedFunctionNames) > 0 {
-		return aistudio.Tools{}, fmt.Errorf("allowedFunctionNames is not supported by AI Studio Web")
-	}
+	toolConfig.AllowedFunctionNames = config.FunctionCallingConfig.AllowedFunctionNames
 	switch strings.ToUpper(config.FunctionCallingConfig.Mode) {
 	case "", "AUTO":
 		toolConfig.Mode = "auto"
 	case "ANY":
-		return aistudio.Tools{}, fmt.Errorf("functionCallingConfig mode ANY is not supported by AI Studio Web")
+		toolConfig.Mode = "required"
+	case "VALIDATED":
+		toolConfig.Mode = "validated"
 	case "NONE":
 		toolConfig.Mode = "none"
 	default:
 		return aistudio.Tools{}, fmt.Errorf("unsupported functionCallingConfig mode %q", config.FunctionCallingConfig.Mode)
-	}
-	if len(mapped.Functions) == 0 && len(mapped.Google) == 0 && mapped.GoogleSearch == nil {
-		return mapped, nil
 	}
 	mapped.ToolConfig = toolConfig
 	return mapped, nil
@@ -780,7 +784,11 @@ func (s *server) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, stream bool) {
+	request.Unary = !stream
 	events, err := s.service.Generate(r.Context(), request)
+	if err == nil && stream {
+		events, err = awaitStreamStart(r.Context(), events)
+	}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeGeminiError(w, statusFromError(err), geminiErrorStatus(err), err.Error())
@@ -828,47 +836,101 @@ func buildGeminiResponse(request aistudio.GenerateRequest, result generationResu
 
 func geminiOutputParts(result generationResult) []map[string]any {
 	parts := make([]map[string]any, 0)
+	var pendingSignature string
+
+	appendPart := func(part map[string]any, sig string) {
+		if sig != "" {
+			part["thoughtSignature"] = sig
+		}
+		if pendingSignature != "" {
+			if part["thoughtSignature"] == nil {
+				part["thoughtSignature"] = pendingSignature
+			} else {
+				parts = append(parts, geminiSignaturePart(pendingSignature))
+			}
+			pendingSignature = ""
+		}
+		parts = append(parts, part)
+	}
+
 	for _, event := range result.events {
 		switch event.Kind {
 		case aistudio.EventText:
-			parts = append(parts, geminiSignedPart(geminiTextPart(event), event.ThoughtSignature))
+			if len(parts) > 0 {
+				last := parts[len(parts)-1]
+				if lastText, ok := last["text"].(string); ok && last["thought"] != true && last["transcriptionMetadata"] == nil && event.Transcript == nil && last["thoughtSignature"] == nil && event.ThoughtSignature == "" {
+					last["text"] = lastText + event.Text
+					continue
+				}
+			}
+			appendPart(geminiTextPart(event), event.ThoughtSignature)
 		case aistudio.EventReasoning:
-			parts = append(parts, geminiSignedPart(map[string]any{"text": event.Text, "thought": true}, event.ThoughtSignature))
+			if len(parts) > 0 {
+				last := parts[len(parts)-1]
+				if lastText, ok := last["text"].(string); ok && last["thought"] == true && last["thoughtSignature"] == nil && event.ThoughtSignature == "" {
+					last["text"] = lastText + event.Text
+					continue
+				}
+			}
+			appendPart(map[string]any{"text": event.Text, "thought": true}, event.ThoughtSignature)
 		case aistudio.EventToolCall:
 			if event.ToolCall != nil {
-				parts = append(parts, geminiSignedPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature))
+				appendPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature)
 			}
 		case aistudio.EventExecutableCode:
 			if event.ExecutableCode != nil {
-				parts = append(parts, geminiSignedPart(map[string]any{"executableCode": map[string]any{
+				appendPart(map[string]any{"executableCode": map[string]any{
 					"language": event.ExecutableCode.Language, "code": event.ExecutableCode.Code,
-				}}, event.ThoughtSignature))
+				}}, event.ThoughtSignature)
 			}
 		case aistudio.EventCodeExecutionResult:
 			if event.CodeExecutionResult != nil {
-				parts = append(parts, geminiSignedPart(map[string]any{
+				appendPart(map[string]any{
 					"codeExecutionResult": geminiCodeExecutionResult(*event.CodeExecutionResult),
-				}, event.ThoughtSignature))
+				}, event.ThoughtSignature)
 			}
 		case aistudio.EventMedia:
 			if event.Media != nil {
+				var part map[string]any
 				if len(event.Media.Data) > 0 {
-					parts = append(parts, geminiSignedPart(map[string]any{"inlineData": map[string]any{
+					part = map[string]any{"inlineData": map[string]any{
 						"mimeType": event.Media.MIME, "data": base64.StdEncoding.EncodeToString(event.Media.Data),
-					}}, event.ThoughtSignature))
+					}}
 				} else if event.Media.URL != "" {
-					parts = append(parts, geminiSignedPart(map[string]any{"fileData": map[string]any{
+					part = map[string]any{"fileData": map[string]any{
 						"mimeType": event.Media.MIME, "fileUri": event.Media.URL, "displayName": event.Media.Name,
-					}}, event.ThoughtSignature))
+					}}
+				}
+				if part != nil {
+					appendPart(part, event.ThoughtSignature)
 				}
 			}
 		case aistudio.EventThoughtSignature:
-			if event.ThoughtSignature != "" {
-				parts = append(parts, map[string]any{"thoughtSignature": event.ThoughtSignature})
+			if event.ThoughtSignature == "" {
+				continue
+			}
+			if pendingSignature != "" {
+				parts = append(parts, geminiSignaturePart(pendingSignature))
+				pendingSignature = ""
+			}
+			if len(parts) > 0 && parts[len(parts)-1]["thoughtSignature"] == nil {
+				parts[len(parts)-1]["thoughtSignature"] = event.ThoughtSignature
+			} else if len(parts) > 0 {
+				parts = append(parts, geminiSignaturePart(event.ThoughtSignature))
+			} else {
+				pendingSignature = event.ThoughtSignature
 			}
 		}
 	}
+	if pendingSignature != "" {
+		parts = append(parts, geminiSignaturePart(pendingSignature))
+	}
 	return parts
+}
+
+// geminiSignaturePart 用空思考 Part 承载没有正文的独立签名
+func geminiSignaturePart(signature string) map[string]any {
+	return map[string]any{"text": "", "thought": true, "thoughtSignature": signature}
 }
 
 func geminiTextPart(event aistudio.Event) map[string]any {
@@ -1128,7 +1190,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 			if event.ThoughtSignature == "" {
 				return nil
 			}
-			response["candidates"] = []any{geminiStreamCandidate(map[string]any{"thoughtSignature": event.ThoughtSignature})}
+			response["candidates"] = []any{geminiStreamCandidate(geminiSignaturePart(event.ThoughtSignature))}
 		default:
 			return nil
 		}
